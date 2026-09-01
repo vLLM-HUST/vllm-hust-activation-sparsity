@@ -15,13 +15,26 @@
   },
   "lifecycle_owner": "vllm",
   "protocols": [
-    {"name": "vllm.operator.sparsity.proposed", "version_range": null}
+    {"name": "vllm.model.projection-transform", "version_range": ">=1,<2"},
+    {"name": "vllm.model.weight-loader-transform", "version_range": ">=1,<2"},
+    {"name": "vllm.compilation.config-hash", "version_range": ">=1,<2"},
+    {"name": "vllm.operator.sparse-linear", "version_range": ">=1,<2"}
+  ],
+  "components": [
+    {
+      "component_id": "activation-sparsity-config",
+      "implementation_ref": "vllm_hust_activation_sparsity.config:ActivationSparsityConfig",
+      "contracts": ["vllm.compilation.config-hash.v1"],
+      "execution_planes": ["worker"],
+      "isolation": "trusted_in_process",
+      "permissions": ["filesystem_read"]
+    }
   ],
   "implementation": [
     {
       "type": "python_module",
-      "module": "vllm_hust_activation_sparsity",
-      "object": "VllmHustActivationSparsityContractProposal",
+      "module": "vllm_hust_activation_sparsity.config",
+      "object": "ActivationSparsityConfig",
       "status": "import_only"
     }
   ],
