@@ -1,0 +1,146 @@
+From f5dd9f1168b4fbfefa2252aa1e27570e7dd434da Mon Sep 17 00:00:00 2001
+From: Seas0 <season1277@outlook.com>
+Date: Fri, 17 Jul 2026 00:42:18 +0800
+Subject: [PATCH] Optimize La RoSA threshold dispatch on Ascend
+
+---
+ tests/sparsity/test_distribution.py | 30 ++++++++++++++++++++++++-
+ vllm/sparsity/distribution.py       | 35 +++++++++++++++++++----------
+ 2 files changed, 52 insertions(+), 13 deletions(-)
+
+diff --git a/tests/sparsity/test_distribution.py b/tests/sparsity/test_distribution.py
+index 89e041a26ec..ceb884f1e80 100644
+--- a/tests/sparsity/test_distribution.py
++++ b/tests/sparsity/test_distribution.py
+@@ -3,8 +3,8 @@
+ import json
+ from types import SimpleNamespace
+ 
+-import torch
+ import pytest
++import torch
+ 
+ import vllm.sparsity.distribution as distribution_module
+ from vllm.sparsity.config import ActivationSparsityConfig
+@@ -128,6 +128,34 @@ def test_row_topk_threshold_topk_backend_matches_default(monkeypatch):
+     assert torch.equal(default_threshold, topk_threshold)
+ 
+ 
++def test_larosa_sparse_linear_threshold_passes_signed_input_to_ascend(
++    monkeypatch,
++):
++    x = torch.tensor([[1.0, -4.0, 3.0, -2.0]], dtype=torch.bfloat16)
++    captured = {}
++
++    def fake_ascend_threshold(value, keep):
++        captured["value"] = value
++        captured["keep"] = keep
++        return torch.tensor([2.0], dtype=torch.float32)
++
++    monkeypatch.delenv("VLLM_LAROSA_TOPK_THRESHOLD_BACKEND", raising=False)
++    monkeypatch.setattr(
++        distribution_module,
++        "_try_ascend_topk_threshold",
++        fake_ascend_threshold,
++    )
++    sparsify = LaRosaSparsifyFn(sparsity_level=0.5, use_sparse_gemv=True)
++
++    threshold, inclusive = sparsify._sparse_linear_threshold(x)
++
++    assert captured["value"] is x
++    assert captured["keep"] == 2
++    assert threshold.dtype == torch.float32
++    assert threshold.tolist() == [2.0]
++    assert inclusive is True
++
++
+ def test_sparsify_fn_moved_threshold():
+     """Threshold buffer should follow module.to(device)."""
+     sparsify = SparsifyFn(torch.tensor(0.5))
+diff --git a/vllm/sparsity/distribution.py b/vllm/sparsity/distribution.py
+index 959f69ffd45..a2580e10a75 100644
+--- a/vllm/sparsity/distribution.py
++++ b/vllm/sparsity/distribution.py
+@@ -8,14 +8,13 @@ from torch import nn
+ 
+ from vllm.sparsity.kernels.sparse_gemv import (
+     can_use_sparse_gemv,
++    should_use_topk_matmul_silu,
+     sparse_gemv_direct_t_cached_impl,
+     sparse_gemv_impl,
+     sparse_gemv_silu_and_mul_direct_t_cached_impl,
+     sparse_gemv_topk_matmul_silu_impl,
+-    should_use_topk_matmul_silu,
+ )
+ 
+-
+ _DEFAULT_SPARSE_GEMV_MIN_SPARSITY = 0.70
+ _DEFAULT_SPARSE_GEMV_MIN_STATIC_THRESHOLD = 1e-6
+ 
+@@ -874,24 +873,30 @@ def row_topk_threshold(x_abs: torch.Tensor, keep: int) -> torch.Tensor:
+     """Return the kth-largest per-row threshold without materializing indices."""
+     backend = os.environ.get(
+         "VLLM_LAROSA_TOPK_THRESHOLD_BACKEND",
+-        "kthvalue",
++        "ascend",
+     ).lower()
+-    if backend == "topk":
+-        topk_values, _ = torch.topk(x_abs, keep, dim=-1)
+-        return topk_values[..., -1]
+     if backend in {"ascend", "ascend_custom", "custom"}:
+         ascend_threshold = _try_ascend_topk_threshold(x_abs, keep)
+         if ascend_threshold is not None:
+             return ascend_threshold
+-    kth = x_abs.shape[-1] - keep + 1
+-    return torch.kthvalue(x_abs, kth, dim=-1).values
++    x_abs_float = x_abs.to(dtype=torch.float32)
++    if backend == "topk":
++        topk_values, _ = torch.topk(x_abs_float, keep, dim=-1)
++        return topk_values[..., -1]
++    kth = x_abs_float.shape[-1] - keep + 1
++    return torch.kthvalue(x_abs_float, kth, dim=-1).values
+ 
+ 
+ def _try_ascend_topk_threshold(
+     x_abs: torch.Tensor,
+     keep: int,
+ ) -> torch.Tensor | None:
+-    if not getattr(x_abs, "is_npu", False):
++    if (
++        not getattr(x_abs, "is_npu", False)
++        or x_abs.dim() != 2
++        or x_abs.shape[0] != 1
++        or x_abs.dtype not in (torch.float16, torch.bfloat16)
++    ):
+         return None
+     ascend_ops = getattr(torch.ops, "_C_ascend", None)
+     if ascend_ops is None:
+@@ -899,8 +904,6 @@ def _try_ascend_topk_threshold(
+     op = getattr(ascend_ops, "activation_sparse_topk_threshold", None)
+     if op is None:
+         return None
+-    if x_abs.dtype != torch.float32:
+-        x_abs = x_abs.to(dtype=torch.float32)
+     return op(x_abs.contiguous(), keep)
+ 
+ 
+@@ -1013,7 +1016,15 @@ class LaRosaSparsifyFn(SparsifyFn):
+                 "La RoSA sparsity_level keeps fewer than one activation for "
+                 f"hidden size {x.shape[-1]}: sparsity_level={self.sparsity_level}."
+             )
+-        threshold = row_topk_threshold(x.abs().to(dtype=torch.float32), keep)
++        backend = os.environ.get(
++            "VLLM_LAROSA_TOPK_THRESHOLD_BACKEND",
++            "ascend",
++        ).lower()
++        if backend in {"ascend", "ascend_custom", "custom"}:
++            threshold = _try_ascend_topk_threshold(x, keep)
++            if threshold is not None:
++                return threshold.contiguous(), True
++        threshold = row_topk_threshold(x.abs(), keep)
+         return threshold.contiguous(), True
+ 
+     def _try_apply_topk_matmul_gate_up_silu(
+-- 
+2.53.0.windows.3
+

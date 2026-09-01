@@ -1,0 +1,221 @@
+From 96965846f45d5c898444c15aebaec7a10626ba9b Mon Sep 17 00:00:00 2001
+From: Seas0 <season1277@outlook.com>
+Date: Thu, 7 May 2026 12:29:28 +0800
+Subject: [PATCH] [sparsity] Implement La RoSA rotation in SparsifyFn with
+ tests
+
+Refactor SparsifyFn to accept an optional rotation parameter instead of
+monkey-patching forward, which is torch.compile-friendly. The La RoSA
+pipeline is: x @ D -> sparsify -> x @ inv_D.
+
+- Update SparsifyFn.__init__ to accept rotation
+- Update build_sparsifier to pass rotation directly
+- Add roundtrip, sparsity, and device-movement tests for La RoSA
+- Add build_sparsifier larosa integration test
+---
+ tests/sparsity/test_distribution.py | 42 +++++++++++++++++++++++++++++
+ tests/sparsity/test_layers.py       | 29 ++++++++++++++++++++
+ vllm/sparsity/distribution.py       | 26 ++++++++++++++++--
+ vllm/sparsity/layers.py             | 25 ++++++-----------
+ 4 files changed, 103 insertions(+), 19 deletions(-)
+
+diff --git a/tests/sparsity/test_distribution.py b/tests/sparsity/test_distribution.py
+index 86cd502f246..2b4da32b7e9 100644
+--- a/tests/sparsity/test_distribution.py
++++ b/tests/sparsity/test_distribution.py
+@@ -73,3 +73,45 @@ def test_sparsify_fn_moved_threshold():
+     sparsify = SparsifyFn(torch.tensor(0.5))
+     sparsify.to("cpu")
+     assert sparsify.threshold.device.type == "cpu"
++
++
++def test_sparsify_fn_with_rotation_roundtrip():
++    """With threshold=0, La RoSA should recover x (up to dtype)."""
++    hidden = 16
++    d = torch.randn(hidden, hidden)
++    inv_d = torch.linalg.inv(d)
++    from vllm.sparsity.rotation import RotationTransform
++
++    rot = RotationTransform(d_matrix=d, inv_d_matrix=inv_d)
++    sparsify = SparsifyFn(threshold=torch.tensor(0.0), rotation=rot)
++
++    x = torch.randn(4, hidden)
++    out = sparsify(x)
++    assert torch.allclose(out, x.to(out.dtype), atol=1e-4)
++
++
++def test_sparsify_fn_with_rotation_sparsity():
++    """La RoSA should sparsify in rotated space and recover."""
++    hidden = 16
++    d = torch.eye(hidden)  # identity rotation for simplicity
++    inv_d = torch.eye(hidden)
++    from vllm.sparsity.rotation import RotationTransform
++
++    rot = RotationTransform(d_matrix=d, inv_d_matrix=inv_d)
++    sparsify = SparsifyFn(threshold=torch.tensor(0.5), rotation=rot)
++
++    x = torch.randn(10, hidden)
++    out = sparsify(x)
++    # With identity rotation, behavior should match plain TEAL
++    expected = SparsifyFn(threshold=torch.tensor(0.5))(x)
++    assert torch.allclose(out, expected, atol=1e-6)
++
++
++def test_sparsify_fn_rotation_device_movement():
++    """Rotation buffers should follow module.to(device)."""
++    hidden = 8
++    rot = RotationTransform(d_matrix=torch.eye(hidden), inv_d_matrix=torch.eye(hidden))
++    sparsify = SparsifyFn(threshold=torch.tensor(0.5), rotation=rot)
++    sparsify.to("cpu")
++    assert sparsify.rotation.D.device.type == "cpu"
++    assert sparsify.rotation.inv_D.device.type == "cpu"
+diff --git a/tests/sparsity/test_layers.py b/tests/sparsity/test_layers.py
+index 4d1dd65f068..bc20d3d2e71 100644
+--- a/tests/sparsity/test_layers.py
++++ b/tests/sparsity/test_layers.py
+@@ -48,3 +48,32 @@ def test_build_sparsifier_success():
+         out = sparsifier(x)
+         # With threshold 0.5, some values should be zeroed
+         assert (out == 0).any()
++
++
++def test_build_sparsifier_larosa():
++    with tempfile.TemporaryDirectory() as tmpdir:
++        # Threshold
++        torch.save(torch.tensor(0.5), os.path.join(tmpdir, "layers.2.self_attn.qkv.threshold.pt"))
++        # Rotation matrices
++        os.makedirs(os.path.join(tmpdir, "layers.2.self_attn.qkv"))
++        hidden = 16
++        d = torch.eye(hidden)
++        inv_d = torch.eye(hidden)
++        torch.save(d, os.path.join(tmpdir, "layers.2.self_attn.qkv", "D.pt"))
++        torch.save(inv_d, os.path.join(tmpdir, "layers.2.self_attn.qkv", "inv_D.pt"))
++
++        cfg = ActivationSparsityConfig(
++            enable=True,
++            method="larosa",
++            calibration_path=tmpdir,
++            apply_all_tokens=True,
++        )
++        sparsifier = build_sparsifier(cfg, layer_idx=2, proj_name="self_attn.qkv")
++
++        assert sparsifier is not None
++        assert sparsifier.rotation is not None
++        x = torch.randn(4, hidden)
++        out = sparsifier(x)
++        assert out.shape == x.shape
++        # With identity rotation + threshold 0.5, some values should be zeroed
++        assert (out == 0).any()
+diff --git a/vllm/sparsity/distribution.py b/vllm/sparsity/distribution.py
+index bb7cdcf7795..a296a459b80 100644
+--- a/vllm/sparsity/distribution.py
++++ b/vllm/sparsity/distribution.py
+@@ -75,29 +75,46 @@ class SparsifyFn(nn.Module):
+ 
+     For Phase 0 this uses a dense ``torch.where`` so that correctness
+     can be validated without requiring a sparse GEMV kernel.
++
++    When ``rotation`` is provided (La RoSA mode), the forward pass becomes:
++    ``x @ D -> sparsify -> x @ inv_D``.
+     """
+ 
+     def __init__(
+         self,
+         threshold: torch.Tensor,
+         apply_all_tokens: bool = True,
++        rotation: "RotationTransform | None" = None,
+     ) -> None:
+         super().__init__()
+         # Register as buffer so threshold moves with module.to(device/dtype)
+         self.register_buffer("threshold", threshold)
+         self.apply_all_tokens = apply_all_tokens
++        self.rotation = rotation
++        if rotation is not None:
++            # Register rotation as a submodule so it follows .to(device/dtype)
++            self.add_module("_rotation", rotation)
+ 
+     def forward(self, x: torch.Tensor) -> torch.Tensor:
+         # Phase 0: apply to all tokens by default.
+         # Phase 1 will add decode-only detection here.
+         if not self.apply_all_tokens and not self._is_decode_only_batch():
+             return x
+-        return torch.where(
++
++        if self.rotation is not None:
++            x = self.rotation(x)
++
++        x = torch.where(
+             x.abs() > self.threshold.to(dtype=x.dtype, device=x.device),
+             x,
+             torch.zeros_like(x),
+         )
+ 
++        if self.rotation is not None:
++            x = self.rotation.inverse(x).to(x.dtype)
++
++        return x
++
+     def _is_decode_only_batch(self) -> bool:
+         """Return True if the current forward batch is decode-only.
+ 
+@@ -110,4 +127,9 @@ class SparsifyFn(nn.Module):
+         return False
+ 
+     def extra_repr(self) -> str:
+-        return f"threshold={self.threshold.item():.4f}, apply_all_tokens={self.apply_all_tokens}"
++        has_rot = self.rotation is not None
++        return (
++            f"threshold={self.threshold.item():.4f}, "
++            f"apply_all_tokens={self.apply_all_tokens}, "
++            f"has_rotation={has_rot}"
++        )
+diff --git a/vllm/sparsity/layers.py b/vllm/sparsity/layers.py
+index d8e3a1778bd..d39e74b5283 100644
+--- a/vllm/sparsity/layers.py
++++ b/vllm/sparsity/layers.py
+@@ -50,12 +50,8 @@ def build_sparsifier(
+         device=str(device),
+     )
+ 
+-    sparsify_fn = SparsifyFn(
+-        threshold=threshold,
+-        apply_all_tokens=sparsity_config.apply_all_tokens,
+-    )
+-
+-    # La RoSA: wrap with rotation if D/inv_D exist
++    # La RoSA: load rotation if D/inv_D exist
++    rotation = None
+     if sparsity_config.method == "larosa":
+         rotation_dir = os.path.join(
+             sparsity_config.calibration_path,
+@@ -65,21 +61,16 @@ def build_sparsifier(
+         inv_d_path = os.path.join(rotation_dir, "inv_D.pt")
+         if os.path.exists(d_path) and os.path.exists(inv_d_path):
+             rotation = RotationTransform(d_path=d_path, inv_d_path=inv_d_path)
+-            # Attach rotation to the sparsify_fn module so it moves together
+-            sparsify_fn.rotation = rotation  # type: ignore[attr-defined]
+-            # Monkey-patch forward to include rotation
+-            _orig_forward = sparsify_fn.forward
+-
+-            def _rotated_forward(x: torch.Tensor) -> torch.Tensor:
+-                x_rot = rotation(x)
+-                x_sparse = _orig_forward(x_rot)
+-                return rotation.inverse(x_sparse).to(x.dtype)
+-
+-            sparsify_fn.forward = _rotated_forward  # type: ignore[method-assign]
+             logger.debug(
+                 "La RoSA rotation enabled for layer %d projection %s",
+                 layer_idx,
+                 proj_name,
+             )
+ 
++    sparsify_fn = SparsifyFn(
++        threshold=threshold,
++        apply_all_tokens=sparsity_config.apply_all_tokens,
++        rotation=rotation,
++    )
++
+     return sparsify_fn
+-- 
+2.53.0.windows.3
+

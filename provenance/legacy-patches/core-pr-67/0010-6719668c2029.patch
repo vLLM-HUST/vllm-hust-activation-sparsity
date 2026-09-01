@@ -1,0 +1,4322 @@
+From 6719668c202905f7e316e1d73e21cdf2cc146a36 Mon Sep 17 00:00:00 2001
+From: Seas0 <season1277@outlook.com>
+Date: Wed, 17 Jun 2026 15:38:58 +0800
+Subject: [PATCH] feat: wire activation sparse kernel verification
+
+---
+ scripts/bench_sparse_kernel_throughput.py     | 447 +++++++++++++
+ scripts/capture_larosa_activation_stats.py    | 418 ++++++++++++
+ scripts/capture_teal_activation_histograms.py | 446 +++++++++++++
+ scripts/eval_larosa_ppl_alignment.py          | 616 ++++++++++++++++++
+ scripts/eval_teal_ppl_alignment.py            | 255 +++++++-
+ scripts/generate_sparse_exp_fixtures.py       | 180 +++++
+ scripts/run_larosa_qwen25_eval.sh             |  83 +++
+ scripts/run_sparse_exp_matrix.sh              | 100 +++
+ scripts/run_sparse_kernel_verification.sh     | 586 +++++++++++++++++
+ tests/sparsity/test_distribution.py           | 156 ++++-
+ tests/sparsity/test_layers.py                 |  30 +-
+ tests/sparsity/test_rotation.py               |  22 +
+ vllm/model_executor/models/llama.py           |  59 +-
+ vllm/model_executor/models/qwen2.py           |  59 +-
+ vllm/sparsity/config.py                       |   5 +-
+ vllm/sparsity/distribution.py                 | 156 ++++-
+ vllm/sparsity/kernels/sparse_gemv.py          | 126 +++-
+ vllm/sparsity/layers.py                       |  16 +-
+ vllm/sparsity/rotation.py                     |   9 +-
+ vllm/sparsity/utils.py                        |  10 +-
+ 20 files changed, 3714 insertions(+), 65 deletions(-)
+ create mode 100644 scripts/bench_sparse_kernel_throughput.py
+ create mode 100644 scripts/capture_larosa_activation_stats.py
+ create mode 100644 scripts/capture_teal_activation_histograms.py
+ create mode 100644 scripts/eval_larosa_ppl_alignment.py
+ create mode 100644 scripts/generate_sparse_exp_fixtures.py
+ create mode 100755 scripts/run_larosa_qwen25_eval.sh
+ create mode 100755 scripts/run_sparse_exp_matrix.sh
+ create mode 100755 scripts/run_sparse_kernel_verification.sh
+
+diff --git a/scripts/bench_sparse_kernel_throughput.py b/scripts/bench_sparse_kernel_throughput.py
+new file mode 100644
+index 00000000000..1f38e59d288
+--- /dev/null
++++ b/scripts/bench_sparse_kernel_throughput.py
+@@ -0,0 +1,447 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Compare dense vs activation-sparse vLLM generation throughput.
++
++This benchmark is intentionally narrow: it uses deterministic token-id prompts
++and toggles only ``activation_sparsity_config`` so the sparse run can be gated
++against the dense run with the same request shape.
++"""
++
++import argparse
++import gc
++import json
++import os
++import random
++import tempfile
++import time
++from pathlib import Path
++from typing import Any
++
++import torch
++
++
++def parse_args() -> argparse.Namespace:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--model", required=True)
++    parser.add_argument("--method", choices=["teal", "larosa"], required=True)
++    parser.add_argument("--calibration-path", type=Path, required=True)
++    parser.add_argument("--sparsity", type=float, default=0.4)
++    parser.add_argument("--num-prompts", type=int, default=32)
++    parser.add_argument("--warmup-prompts", type=int, default=4)
++    parser.add_argument("--input-len", type=int, default=128)
++    parser.add_argument("--output-len", type=int, default=128)
++    parser.add_argument("--seed", type=int, default=0)
++    parser.add_argument(
++        "--dtype",
++        choices=["float16", "bfloat16"],
++        default="bfloat16",
++    )
++    parser.add_argument("--trust-remote-code", action="store_true")
++    parser.add_argument("--gpu-memory-utilization", type=float, default=0.75)
++    parser.add_argument("--max-model-len", type=int, default=None)
++    parser.add_argument("--enforce-eager", action="store_true")
++    parser.add_argument("--shutdown-timeout", type=int, default=60)
++    parser.add_argument("--vllm-prefill-sparsify", default="none")
++    parser.add_argument("--allow-sparse-gemv-fallback", action="store_true")
++    parser.add_argument(
++        "--no-require-sparse-invocations",
++        action="store_true",
++        help="Do not fail when the vLLM sparse GEMV shim is never invoked.",
++    )
++    parser.add_argument("--min-total-token-speedup", type=float, default=1.0)
++    parser.add_argument("--min-output-token-speedup", type=float, default=1.0)
++    parser.add_argument("--json-output", type=Path, default=None)
++    return parser.parse_args()
++
++
++def synchronize() -> None:
++    if hasattr(torch, "npu") and torch.npu.is_available():
++        torch.npu.synchronize()
++    elif torch.cuda.is_available():
++        torch.cuda.synchronize()
++
++
++def empty_backend_cache() -> None:
++    if hasattr(torch, "npu") and torch.npu.is_available():
++        torch.npu.empty_cache()
++    elif torch.cuda.is_available():
++        torch.cuda.empty_cache()
++
++
++def build_prompts(
++    model: str,
++    num_prompts: int,
++    input_len: int,
++    seed: int,
++    trust_remote_code: bool,
++) -> list[dict[str, list[int]]]:
++    from transformers import AutoTokenizer
++
++    tokenizer = AutoTokenizer.from_pretrained(
++        model,
++        trust_remote_code=trust_remote_code,
++    )
++    vocab_size = int(getattr(tokenizer, "vocab_size", 0))
++    if vocab_size <= 0:
++        raise ValueError(f"Tokenizer for {model!r} has invalid vocab_size={vocab_size}")
++
++    excluded_ids = {
++        token_id
++        for token_id in tokenizer.all_special_ids
++        if isinstance(token_id, int) and 0 <= token_id < vocab_size
++    }
++    candidate_ids = [i for i in range(vocab_size) if i not in excluded_ids]
++    if not candidate_ids:
++        raise ValueError(f"Tokenizer for {model!r} has no non-special token ids")
++
++    rng = random.Random(seed)
++    prompts: list[dict[str, list[int]]] = []
++    for _ in range(num_prompts):
++        prompt_token_ids = [rng.choice(candidate_ids) for _ in range(input_len)]
++        prompts.append({"prompt_token_ids": prompt_token_ids})
++    return prompts
++
++
++def build_sparse_config(args: argparse.Namespace) -> dict[str, Any]:
++    common: dict[str, Any] = {
++        "enable": True,
++        "method": args.method,
++        "uniform_sparsity": args.sparsity,
++        "calibration_path": str(args.calibration_path.resolve()),
++        "decode_only": False,
++        "strict_unsupported_check": True,
++        "use_sparse_gemv": True,
++    }
++    if args.method == "teal":
++        common.update(
++            {
++                "apply_all_tokens": False,
++                "prefill_sparsify": args.vllm_prefill_sparsify,
++            }
++        )
++    else:
++        common.update(
++            {
++                "apply_all_tokens": args.vllm_prefill_sparsify == "all",
++                "prefill_sparsify": args.vllm_prefill_sparsify,
++            }
++        )
++    return common
++
++
++def build_llm(
++    args: argparse.Namespace,
++    activation_sparsity_config: dict[str, Any] | None,
++) -> Any:
++    from vllm import LLM
++
++    kwargs: dict[str, Any] = {
++        "model": args.model,
++        "dtype": args.dtype,
++        "max_model_len": args.max_model_len or (args.input_len + args.output_len + 8),
++        "gpu_memory_utilization": args.gpu_memory_utilization,
++        "enforce_eager": args.enforce_eager,
++        "shutdown_timeout": args.shutdown_timeout,
++        "trust_remote_code": args.trust_remote_code,
++        "seed": args.seed,
++    }
++    if activation_sparsity_config is not None:
++        kwargs["activation_sparsity_config"] = activation_sparsity_config
++    return LLM(**kwargs)
++
++
++def run_case(
++    args: argparse.Namespace,
++    prompts: list[dict[str, list[int]]],
++    activation_sparsity_config: dict[str, Any] | None,
++    label: str,
++) -> dict[str, Any]:
++    from vllm import SamplingParams
++
++    llm = build_llm(args, activation_sparsity_config)
++    sampling_params = SamplingParams(
++        temperature=0.0,
++        max_tokens=args.output_len,
++        ignore_eos=True,
++        detokenize=False,
++    )
++
++    warmup_prompts = prompts[: args.warmup_prompts]
++    if warmup_prompts:
++        llm.generate(warmup_prompts, sampling_params, use_tqdm=False)
++        synchronize()
++
++    synchronize()
++    start = time.perf_counter()
++    outputs = llm.generate(prompts, sampling_params, use_tqdm=True)
++    synchronize()
++    elapsed = time.perf_counter() - start
++
++    prompt_tokens = sum(len(output.prompt_token_ids or []) for output in outputs)
++    output_tokens = sum(
++        len(completion.token_ids)
++        for output in outputs
++        for completion in output.outputs
++        if completion is not None
++    )
++    expected_output_tokens = len(prompts) * args.output_len
++    total_tokens = prompt_tokens + output_tokens
++    del llm
++    gc.collect()
++    empty_backend_cache()
++
++    return {
++        "label": label,
++        "elapsed_s": elapsed,
++        "num_prompts": len(prompts),
++        "prompt_tokens": prompt_tokens,
++        "output_tokens": output_tokens,
++        "expected_output_tokens": expected_output_tokens,
++        "output_token_completion_ratio": output_tokens / expected_output_tokens,
++        "total_tokens": total_tokens,
++        "requests_per_second": len(prompts) / elapsed,
++        "total_tokens_per_second": total_tokens / elapsed,
++        "output_tokens_per_second": output_tokens / elapsed,
++    }
++
++
++def reset_sparse_invocation_counter() -> None:
++    from vllm.sparsity.kernels.sparse_gemv import (
++        reset_sparse_gemv_invocation_count,
++    )
++
++    reset_sparse_gemv_invocation_count()
++
++
++def get_sparse_invocation_counter() -> int:
++    from vllm.sparsity.kernels.sparse_gemv import (
++        get_sparse_gemv_invocation_count,
++    )
++
++    return get_sparse_gemv_invocation_count()
++
++
++def read_marker_records(marker_path: Path) -> list[dict[str, Any]]:
++    if not marker_path.exists():
++        return []
++    records = []
++    for line in marker_path.read_text(encoding="utf-8").splitlines():
++        if not line:
++            continue
++        records.append(json.loads(line))
++    return records
++
++
++def unique_marker_values(
++    records: list[dict[str, Any]],
++    key: str,
++) -> list[Any]:
++    values: list[Any] = []
++    seen: set[str] = set()
++    for record in records:
++        if key not in record:
++            continue
++        value = record[key]
++        marker = json.dumps(value, sort_keys=True)
++        if marker in seen:
++            continue
++        seen.add(marker)
++        values.append(value)
++    return values
++
++
++def main() -> int:
++    args = parse_args()
++    if args.num_prompts <= 0:
++        raise ValueError("--num-prompts must be positive")
++    if args.input_len <= 0 or args.output_len <= 0:
++        raise ValueError("--input-len and --output-len must be positive")
++    if args.warmup_prompts < 0 or args.warmup_prompts > args.num_prompts:
++        raise ValueError("--warmup-prompts must be in [0, num-prompts]")
++    if args.sparsity < 0.0 or args.sparsity >= 1.0:
++        raise ValueError("--sparsity must be in [0, 1)")
++    if args.method == "larosa" and args.sparsity * 1.2 >= 1.0:
++        raise ValueError("La RoSA h2 sparsity is sparsity * 1.2 and must be < 1")
++
++    prompts = build_prompts(
++        args.model,
++        args.num_prompts,
++        args.input_len,
++        args.seed,
++        args.trust_remote_code,
++    )
++    dense = run_case(args, prompts, None, "dense")
++
++    previous_require_kernel = os.environ.get("VLLM_SPARSE_GEMV_REQUIRE_KERNEL")
++    previous_marker_path = os.environ.get("VLLM_SPARSE_GEMV_MARKER_PATH")
++    previous_ascend_marker_path = os.environ.get(
++        "VLLM_ASCEND_SPARSE_LINEAR_MARKER_PATH"
++    )
++    os.environ["VLLM_SPARSE_GEMV_REQUIRE_KERNEL"] = (
++        "0" if args.allow_sparse_gemv_fallback else "1"
++    )
++    marker_tmpdir = tempfile.TemporaryDirectory(prefix="vllm_sparse_gemv_")
++    marker_path = Path(marker_tmpdir.name) / "invocations.jsonl"
++    ascend_marker_path = Path(marker_tmpdir.name) / "ascend_custom_ops.jsonl"
++    os.environ["VLLM_SPARSE_GEMV_MARKER_PATH"] = str(marker_path)
++    os.environ["VLLM_ASCEND_SPARSE_LINEAR_MARKER_PATH"] = str(ascend_marker_path)
++    reset_sparse_invocation_counter()
++    try:
++        sparse = run_case(args, prompts, build_sparse_config(args), "sparse")
++    finally:
++        if previous_require_kernel is None:
++            os.environ.pop("VLLM_SPARSE_GEMV_REQUIRE_KERNEL", None)
++        else:
++            os.environ["VLLM_SPARSE_GEMV_REQUIRE_KERNEL"] = previous_require_kernel
++        if previous_marker_path is None:
++            os.environ.pop("VLLM_SPARSE_GEMV_MARKER_PATH", None)
++        else:
++            os.environ["VLLM_SPARSE_GEMV_MARKER_PATH"] = previous_marker_path
++        if previous_ascend_marker_path is None:
++            os.environ.pop("VLLM_ASCEND_SPARSE_LINEAR_MARKER_PATH", None)
++        else:
++            os.environ["VLLM_ASCEND_SPARSE_LINEAR_MARKER_PATH"] = (
++                previous_ascend_marker_path
++            )
++
++    sparse_invocations_current_process = get_sparse_invocation_counter()
++    sparse_marker_records = read_marker_records(marker_path)
++    ascend_marker_records = read_marker_records(ascend_marker_path)
++    sparse_marker_pids = sorted(
++        {
++            int(record["pid"])
++            for record in sparse_marker_records
++            if "pid" in record
++        }
++    )
++    ascend_marker_pids = sorted(
++        {
++            int(record["pid"])
++            for record in ascend_marker_records
++            if "pid" in record
++        }
++    )
++    ascend_marker_ops = sorted(
++        {
++            str(record["op"])
++            for record in ascend_marker_records
++            if "op" in record
++        }
++    )
++    sparse.update(
++        {
++            "sparse_gemv_invocations_current_process": (
++                sparse_invocations_current_process
++            ),
++            "sparse_gemv_marker_records": len(sparse_marker_records),
++            "sparse_gemv_marker_pids": sparse_marker_pids,
++            "sparse_gemv_marker_x_shapes": unique_marker_values(
++                sparse_marker_records,
++                "x_shape",
++            ),
++            "sparse_gemv_marker_threshold_shapes": unique_marker_values(
++                sparse_marker_records,
++                "threshold_shape",
++            ),
++            "sparse_gemv_marker_threshold_numels": unique_marker_values(
++                sparse_marker_records,
++                "threshold_numel",
++            ),
++            "sparse_gemv_marker_inclusive": unique_marker_values(
++                sparse_marker_records,
++                "inclusive",
++            ),
++            "sparse_gemv_marker_weight_t_provided": unique_marker_values(
++                sparse_marker_records,
++                "weight_t_provided",
++            ),
++            "ascend_sparse_linear_marker_records": len(ascend_marker_records),
++            "ascend_sparse_linear_marker_pids": ascend_marker_pids,
++            "ascend_sparse_linear_marker_ops": ascend_marker_ops,
++            "ascend_sparse_linear_marker_x_shapes": unique_marker_values(
++                ascend_marker_records,
++                "x_shape",
++            ),
++            "ascend_sparse_linear_marker_threshold_shapes": unique_marker_values(
++                ascend_marker_records,
++                "threshold_shape",
++            ),
++            "ascend_sparse_linear_marker_threshold_numels": unique_marker_values(
++                ascend_marker_records,
++                "threshold_numel",
++            ),
++            "ascend_sparse_linear_marker_inclusive": unique_marker_values(
++                ascend_marker_records,
++                "inclusive",
++            ),
++            "ascend_sparse_linear_marker_weight_t_provided": unique_marker_values(
++                ascend_marker_records,
++                "weight_t_provided",
++            ),
++        }
++    )
++    marker_tmpdir.cleanup()
++
++    total_token_speedup = (
++        sparse["total_tokens_per_second"] / dense["total_tokens_per_second"]
++    )
++    output_token_speedup = (
++        sparse["output_tokens_per_second"] / dense["output_tokens_per_second"]
++    )
++
++    failures = []
++    for case in (dense, sparse):
++        if case["output_tokens"] != case["expected_output_tokens"]:
++            failures.append(
++                f"{case['label']} generated {case['output_tokens']} output "
++                f"tokens, expected {case['expected_output_tokens']}"
++            )
++    if (
++        not args.no_require_sparse_invocations
++        and sparse_invocations_current_process == 0
++        and not sparse_marker_records
++    ):
++        failures.append("sparse run did not invoke vLLM sparse GEMV shim")
++    if not args.allow_sparse_gemv_fallback and not ascend_marker_records:
++        failures.append(
++            "sparse run did not invoke Ascend sparse linear custom-op wrapper"
++        )
++    if total_token_speedup < args.min_total_token_speedup:
++        failures.append(
++            "total token throughput speedup "
++            f"{total_token_speedup:.6g} < {args.min_total_token_speedup:.6g}"
++        )
++    if output_token_speedup < args.min_output_token_speedup:
++        failures.append(
++            "output token throughput speedup "
++            f"{output_token_speedup:.6g} < {args.min_output_token_speedup:.6g}"
++        )
++
++    result = {
++        "method": args.method,
++        "model": args.model,
++        "calibration_path": str(args.calibration_path.resolve()),
++        "sparsity": args.sparsity,
++        "input_len": args.input_len,
++        "output_len": args.output_len,
++        "num_prompts": args.num_prompts,
++        "dtype": args.dtype,
++        "require_sparse_gemv_kernel": not args.allow_sparse_gemv_fallback,
++        "dense": dense,
++        "sparse": sparse,
++        "total_token_speedup": total_token_speedup,
++        "output_token_speedup": output_token_speedup,
++        "passed": not failures,
++        "failures": failures,
++    }
++    print(json.dumps(result, indent=2, sort_keys=True))
++    if args.json_output is not None:
++        args.json_output.parent.mkdir(parents=True, exist_ok=True)
++        args.json_output.write_text(
++            json.dumps(result, indent=2, sort_keys=True) + "\n",
++            encoding="utf-8",
++        )
++    return 0 if result["passed"] else 1
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/scripts/capture_larosa_activation_stats.py b/scripts/capture_larosa_activation_stats.py
+new file mode 100644
+index 00000000000..94afd3cb893
+--- /dev/null
++++ b/scripts/capture_larosa_activation_stats.py
+@@ -0,0 +1,418 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Capture La RoSA activation statistics and rotations for Qwen-style models.
++
++This script generates artifacts compatible with the official La RoSA layout:
++
++    {output_path}/histograms/layer-{idx}/self_attn/D.pt
++
++It can also write the MLP rotation under ``mlp/D.pt`` for inspection and future
++experiments. The current official Qwen2.5 La RoSA inference path reuses the
++per-layer ``self_attn/D.pt`` rotation for both attention and MLP first-site
++sparsification, so that path remains the required vLLM artifact.
++"""
++
++from __future__ import annotations
++
++import argparse
++import gc
++import json
++from collections.abc import Iterable
++from pathlib import Path
++from typing import Any
++
++import torch
++from tqdm import tqdm
++
++DEFAULT_MODEL = "Qwen/Qwen2.5-7B"
++
++
++def parse_args() -> argparse.Namespace:
++    parser = argparse.ArgumentParser(
++        description=(
++            "Generate La RoSA covariance/eigenvector artifacts from sampled "
++            "activation windows."
++        )
++    )
++    parser.add_argument("--model", default=DEFAULT_MODEL)
++    parser.add_argument(
++        "--output-path",
++        type=Path,
++        required=True,
++        help="Artifact root; rotations are saved under <root>/histograms/.",
++    )
++
++    dataset = parser.add_argument_group("dataset")
++    dataset.add_argument("--dataset-name", default="wikitext")
++    dataset.add_argument("--dataset-subset", default="wikitext-2-raw-v1")
++    dataset.add_argument("--dataset-split", default="train")
++    dataset.add_argument("--dataset-text-field", default="text")
++    dataset.add_argument("--dataset-size", type=int, default=500)
++    dataset.add_argument(
++        "--dataset-sample",
++        choices=["first", "random"],
++        default="random",
++        help="Use the first N rows or a seeded random subset.",
++    )
++    dataset.add_argument("--dataset-seed", type=int, default=0)
++    dataset.add_argument("--text-file", type=Path, default=None)
++    dataset.add_argument("--inline-text", action="append", default=None)
++
++    runtime = parser.add_argument_group("runtime")
++    runtime.add_argument("--sequence-length", type=int, default=2048)
++    runtime.add_argument("--batch-size", type=int, default=1)
++    runtime.add_argument(
++        "--max-sequences",
++        type=int,
++        default=None,
++        help="Optional sampled sequence cap. Leave unset for all built windows.",
++    )
++    runtime.add_argument(
++        "--dtype",
++        choices=["float16", "bfloat16", "float32"],
++        default="bfloat16",
++    )
++    runtime.add_argument(
++        "--device",
++        default="auto",
++        help="auto, npu, cuda, cpu, or a concrete torch device like npu:0.",
++    )
++    runtime.add_argument(
++        "--attn-implementation",
++        default="eager",
++        choices=["eager", "sdpa", "flash_attention_2"],
++    )
++    runtime.add_argument(
++        "--stat-device",
++        default="cpu",
++        help="Where covariance matrices are accumulated, usually cpu.",
++    )
++    runtime.add_argument("--damp-percent", type=float, default=0.01)
++    runtime.add_argument(
++        "--save-covariance",
++        action="store_true",
++        help="Also save large covariance.pt files for each layer/projection.",
++    )
++    runtime.add_argument(
++        "--capture-mlp",
++        action="store_true",
++        help="Also capture and eigensolve layer MLP covariance matrices.",
++    )
++
++    return parser.parse_args()
++
++
++def torch_dtype(name: str) -> torch.dtype:
++    return {
++        "float16": torch.float16,
++        "bfloat16": torch.bfloat16,
++        "float32": torch.float32,
++    }[name]
++
++
++def resolve_device(device: str) -> torch.device:
++    if device != "auto":
++        return torch.device(device)
++    if hasattr(torch, "npu") and torch.npu.is_available():
++        return torch.device("npu:0")
++    if torch.cuda.is_available():
++        return torch.device("cuda:0")
++    return torch.device("cpu")
++
++
++def empty_device_cache(device: torch.device) -> None:
++    if device.type == "cuda":
++        torch.cuda.empty_cache()
++    elif device.type == "npu" and hasattr(torch, "npu"):
++        torch.npu.empty_cache()
++
++
++def load_texts(args: argparse.Namespace) -> list[str]:
++    if args.inline_text:
++        return args.inline_text
++
++    if args.text_file:
++        text = args.text_file.read_text()
++        paragraphs = [p.strip() for p in text.split("\n\n")]
++        return [p for p in paragraphs if p]
++
++    from datasets import load_dataset
++
++    dataset = load_dataset(
++        args.dataset_name,
++        args.dataset_subset,
++        split=args.dataset_split,
++    )
++    if args.dataset_size is not None:
++        size = min(args.dataset_size, len(dataset))
++        if args.dataset_sample == "random":
++            dataset = dataset.shuffle(seed=args.dataset_seed).select(range(size))
++        else:
++            dataset = dataset.select(range(size))
++    return [str(sample[args.dataset_text_field]) for sample in dataset]
++
++
++def build_token_windows(
++    tokenizer: Any,
++    texts: Iterable[str],
++    sequence_length: int,
++    max_sequences: int | None,
++) -> list[list[int]]:
++    text = "\n\n".join(t for t in texts if t.strip())
++    token_ids = tokenizer(text, add_special_tokens=False).input_ids
++    num_sequences = len(token_ids) // sequence_length
++    if max_sequences is not None:
++        num_sequences = min(num_sequences, max_sequences)
++    if num_sequences <= 0:
++        raise ValueError(
++            "No full activation-capture windows were produced. "
++            f"Need at least {sequence_length} tokens."
++        )
++    return [
++        token_ids[i * sequence_length : (i + 1) * sequence_length]
++        for i in range(num_sequences)
++    ]
++
++
++class CovarianceCollector:
++    def __init__(
++        self,
++        num_layers: int,
++        hidden_size: int,
++        stat_device: torch.device,
++        capture_mlp: bool,
++    ) -> None:
++        self.hidden_size = hidden_size
++        self.capture_mlp = capture_mlp
++        self.attn_cov = [
++            torch.zeros(
++                (hidden_size, hidden_size),
++                dtype=torch.float32,
++                device=stat_device,
++            )
++            for _ in range(num_layers)
++        ]
++        self.mlp_cov = (
++            [
++                torch.zeros(
++                    (hidden_size, hidden_size),
++                    dtype=torch.float32,
++                    device=stat_device,
++                )
++                for _ in range(num_layers)
++            ]
++            if capture_mlp
++            else []
++        )
++        self.attn_tokens = [0 for _ in range(num_layers)]
++        self.mlp_tokens = [0 for _ in range(num_layers)] if capture_mlp else []
++
++    def hook(self, layer_idx: int, projection: str):
++        def _hook(module: torch.nn.Module, inputs: tuple[Any, ...]) -> None:
++            del module
++            x = inputs[0].detach()
++            x = x.reshape(-1, x.shape[-1]).to(
++                device=self.attn_cov[layer_idx].device,
++                dtype=torch.float32,
++            )
++            cov = x.t().matmul(x)
++            if projection == "self_attn":
++                self.attn_cov[layer_idx].add_(cov)
++                self.attn_tokens[layer_idx] += x.shape[0]
++            elif projection == "mlp":
++                if not self.capture_mlp:
++                    return
++                self.mlp_cov[layer_idx].add_(cov)
++                self.mlp_tokens[layer_idx] += x.shape[0]
++            else:
++                raise ValueError(f"Unknown projection {projection!r}.")
++
++        return _hook
++
++
++def save_rotation_from_covariance(
++    cov: torch.Tensor,
++    output_dir: Path,
++    *,
++    damp_percent: float,
++    token_count: int,
++    save_covariance: bool,
++) -> dict[str, Any]:
++    output_dir.mkdir(parents=True, exist_ok=True)
++
++    cov_cpu = cov.detach().to(device="cpu", dtype=torch.float32)
++    diag_mean = torch.mean(torch.diag(cov_cpu))
++    damp = damp_percent * diag_mean
++    idx = torch.arange(cov_cpu.shape[-1])
++    cov_cpu[idx, idx] += damp
++
++    eigenvalues, eigenvectors = torch.linalg.eigh(cov_cpu)
++    rotation = eigenvectors.contiguous().to(dtype=torch.float32)
++    inverse = rotation.t().contiguous()
++
++    torch.save(rotation, output_dir / "D.pt")
++    torch.save(inverse, output_dir / "inv_D.pt")
++    torch.save(eigenvalues.to(dtype=torch.float32), output_dir / "eigenvalues.pt")
++    if save_covariance:
++        torch.save(cov_cpu, output_dir / "covariance.pt")
++
++    return {
++        "tokens": token_count,
++        "hidden_size": cov_cpu.shape[-1],
++        "damp_percent": damp_percent,
++        "damp": float(damp.item()),
++        "diag_mean": float(diag_mean.item()),
++        "rotation_dtype": "float32",
++    }
++
++
++def install_hooks(
++    model: torch.nn.Module,
++    collector: CovarianceCollector,
++) -> list[Any]:
++    handles: list[Any] = []
++    layers = model.model.layers
++    for layer_idx, layer in enumerate(layers):
++        handles.append(
++            layer.self_attn.q_proj.register_forward_pre_hook(
++                collector.hook(layer_idx, "self_attn")
++            )
++        )
++        if collector.capture_mlp:
++            handles.append(
++                layer.mlp.gate_proj.register_forward_pre_hook(
++                    collector.hook(layer_idx, "mlp")
++                )
++            )
++    return handles
++
++
++def main() -> int:
++    args = parse_args()
++    args.output_path = args.output_path.resolve()
++    device = resolve_device(args.device)
++    stat_device = torch.device(args.stat_device)
++
++    from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
++
++    config = AutoConfig.from_pretrained(args.model, trust_remote_code=True)
++    if getattr(config, "model_type", None) != "qwen2":
++        raise ValueError(
++            "This capture script is intended for Qwen2/Qwen2.5 models; "
++            f"got model_type={getattr(config, 'model_type', None)!r}."
++        )
++
++    tokenizer = AutoTokenizer.from_pretrained(
++        args.model,
++        use_fast=True,
++        trust_remote_code=True,
++    )
++    if tokenizer.pad_token_id is None:
++        tokenizer.pad_token_id = (
++            tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0
++        )
++
++    texts = load_texts(args)
++    windows = build_token_windows(
++        tokenizer,
++        texts,
++        args.sequence_length,
++        args.max_sequences,
++    )
++
++    print(
++        "setup: "
++        f"model={args.model}, device={device}, stat_device={stat_device}, "
++        f"dtype={args.dtype}, sequence_length={args.sequence_length}, "
++        f"sequences={len(windows)}, output_path={args.output_path}"
++    )
++
++    model = AutoModelForCausalLM.from_pretrained(
++        args.model,
++        torch_dtype=torch_dtype(args.dtype),
++        trust_remote_code=True,
++        attn_implementation=args.attn_implementation,
++        low_cpu_mem_usage=True,
++    )
++    model.eval()
++    model.to(device)
++    model.config.use_cache = False
++
++    collector = CovarianceCollector(
++        num_layers=int(config.num_hidden_layers),
++        hidden_size=int(config.hidden_size),
++        stat_device=stat_device,
++        capture_mlp=args.capture_mlp,
++    )
++    handles = install_hooks(model, collector)
++
++    try:
++        for start in tqdm(
++            range(0, len(windows), args.batch_size),
++            desc="capture activation covariance",
++        ):
++            batch = windows[start : start + args.batch_size]
++            input_ids = torch.tensor(batch, dtype=torch.long, device=device)
++            with torch.no_grad():
++                model(input_ids=input_ids, use_cache=False)
++            del input_ids
++            empty_device_cache(device)
++    finally:
++        for handle in handles:
++            handle.remove()
++
++    metadata: dict[str, Any] = {
++        "model": args.model,
++        "model_type": getattr(config, "model_type", None),
++        "dataset": {
++            "name": args.dataset_name,
++            "subset": args.dataset_subset,
++            "split": args.dataset_split,
++            "size": args.dataset_size,
++            "sample": args.dataset_sample,
++            "seed": args.dataset_seed,
++            "text_file": str(args.text_file) if args.text_file else None,
++        },
++        "sequence_length": args.sequence_length,
++        "batch_size": args.batch_size,
++        "sequences": len(windows),
++        "dtype": args.dtype,
++        "device": str(device),
++        "stat_device": str(stat_device),
++        "capture_mlp": args.capture_mlp,
++        "layers": {},
++    }
++
++    for layer_idx in tqdm(range(int(config.num_hidden_layers)), desc="save rotations"):
++        layer_root = args.output_path / "histograms" / f"layer-{layer_idx}"
++        layer_metadata = {
++            "self_attn": save_rotation_from_covariance(
++                collector.attn_cov[layer_idx],
++                layer_root / "self_attn",
++                damp_percent=args.damp_percent,
++                token_count=collector.attn_tokens[layer_idx],
++                save_covariance=args.save_covariance,
++            ),
++        }
++        if args.capture_mlp:
++            layer_metadata["mlp"] = save_rotation_from_covariance(
++                collector.mlp_cov[layer_idx],
++                layer_root / "mlp",
++                damp_percent=args.damp_percent,
++                token_count=collector.mlp_tokens[layer_idx],
++                save_covariance=args.save_covariance,
++            )
++        metadata["layers"][str(layer_idx)] = layer_metadata
++
++    args.output_path.mkdir(parents=True, exist_ok=True)
++    (args.output_path / "activation_stats_metadata.json").write_text(
++        json.dumps(metadata, indent=2) + "\n"
++    )
++
++    del model
++    gc.collect()
++    empty_device_cache(device)
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/scripts/capture_teal_activation_histograms.py b/scripts/capture_teal_activation_histograms.py
+new file mode 100644
+index 00000000000..4b03927f9be
+--- /dev/null
++++ b/scripts/capture_teal_activation_histograms.py
+@@ -0,0 +1,446 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Capture TEAL activation histograms and thresholds for Qwen-style models."""
++
++from __future__ import annotations
++
++import argparse
++import gc
++import json
++import math
++from collections.abc import Iterable
++from pathlib import Path
++from typing import Any
++
++import torch
++from tqdm import tqdm
++
++DEFAULT_MODEL = "Qwen/Qwen2.5-7B"
++PROJECTION_THRESHOLDS = {
++    "self_attn.qkv": ("self_attn", "h1"),
++    "self_attn.o": ("self_attn", "h2"),
++    "mlp.gate_up": ("mlp", "h1"),
++    "mlp.down": ("mlp", "h2"),
++}
++
++
++def parse_args() -> argparse.Namespace:
++    parser = argparse.ArgumentParser(
++        description="Generate TEAL histogram/threshold artifacts from activations."
++    )
++    parser.add_argument("--model", default=DEFAULT_MODEL)
++    parser.add_argument("--output-path", type=Path, required=True)
++    parser.add_argument("--sparsity", type=float, default=0.4)
++
++    dataset = parser.add_argument_group("dataset")
++    dataset.add_argument("--dataset-name", default="wikitext")
++    dataset.add_argument("--dataset-subset", default="wikitext-2-raw-v1")
++    dataset.add_argument("--dataset-split", default="train")
++    dataset.add_argument("--dataset-text-field", default="text")
++    dataset.add_argument("--dataset-size", type=int, default=500)
++    dataset.add_argument(
++        "--dataset-sample",
++        choices=["first", "random"],
++        default="random",
++    )
++    dataset.add_argument("--dataset-seed", type=int, default=0)
++    dataset.add_argument("--text-file", type=Path, default=None)
++    dataset.add_argument("--inline-text", action="append", default=None)
++
++    runtime = parser.add_argument_group("runtime")
++    runtime.add_argument("--sequence-length", type=int, default=2048)
++    runtime.add_argument("--batch-size", type=int, default=1)
++    runtime.add_argument("--max-sequences", type=int, default=None)
++    runtime.add_argument("--histogram-bins", type=int, default=2048)
++    runtime.add_argument(
++        "--dtype",
++        choices=["float16", "bfloat16", "float32"],
++        default="bfloat16",
++    )
++    runtime.add_argument("--device", default="auto")
++    runtime.add_argument(
++        "--attn-implementation",
++        default="eager",
++        choices=["eager", "sdpa", "flash_attention_2"],
++    )
++
++    return parser.parse_args()
++
++
++def torch_dtype(name: str) -> torch.dtype:
++    return {
++        "float16": torch.float16,
++        "bfloat16": torch.bfloat16,
++        "float32": torch.float32,
++    }[name]
++
++
++def resolve_device(device: str) -> torch.device:
++    if device != "auto":
++        return torch.device(device)
++    if hasattr(torch, "npu") and torch.npu.is_available():
++        return torch.device("npu:0")
++    if torch.cuda.is_available():
++        return torch.device("cuda:0")
++    return torch.device("cpu")
++
++
++def empty_device_cache(device: torch.device) -> None:
++    if device.type == "cuda":
++        torch.cuda.empty_cache()
++    elif device.type == "npu" and hasattr(torch, "npu"):
++        torch.npu.empty_cache()
++
++
++def load_texts(args: argparse.Namespace) -> list[str]:
++    if args.inline_text:
++        return args.inline_text
++
++    if args.text_file:
++        text = args.text_file.read_text()
++        paragraphs = [p.strip() for p in text.split("\n\n")]
++        return [p for p in paragraphs if p]
++
++    from datasets import load_dataset
++
++    dataset = load_dataset(
++        args.dataset_name,
++        args.dataset_subset,
++        split=args.dataset_split,
++    )
++    if args.dataset_size is not None:
++        size = min(args.dataset_size, len(dataset))
++        if args.dataset_sample == "random":
++            dataset = dataset.shuffle(seed=args.dataset_seed).select(range(size))
++        else:
++            dataset = dataset.select(range(size))
++    return [str(sample[args.dataset_text_field]) for sample in dataset]
++
++
++def build_token_windows(
++    tokenizer: Any,
++    texts: Iterable[str],
++    sequence_length: int,
++    max_sequences: int | None,
++) -> list[list[int]]:
++    text = "\n\n".join(t for t in texts if t.strip())
++    token_ids = tokenizer(text, add_special_tokens=False).input_ids
++    num_sequences = len(token_ids) // sequence_length
++    if max_sequences is not None:
++        num_sequences = min(num_sequences, max_sequences)
++    if num_sequences <= 0:
++        raise ValueError(
++            "No full TEAL histogram windows were produced. "
++            f"Need at least {sequence_length} tokens."
++        )
++    return [
++        token_ids[i * sequence_length : (i + 1) * sequence_length]
++        for i in range(num_sequences)
++    ]
++
++
++def site_key(layer_idx: int, part: str, hidden_type: str) -> tuple[int, str, str]:
++    return (layer_idx, part, hidden_type)
++
++
++class RangeCollector:
++    def __init__(self, num_layers: int) -> None:
++        self.max_abs = {
++            site_key(layer_idx, part, hidden_type): 0.0
++            for layer_idx in range(num_layers)
++            for part in ("self_attn", "mlp")
++            for hidden_type in ("h1", "h2")
++        }
++
++    def hook(self, layer_idx: int, part: str, hidden_type: str):
++        key = site_key(layer_idx, part, hidden_type)
++
++        def _hook(module: torch.nn.Module, inputs: tuple[Any, ...]) -> None:
++            del module
++            x = inputs[0].detach()
++            value = float(x.abs().max().to(device="cpu", dtype=torch.float32).item())
++            self.max_abs[key] = max(self.max_abs[key], value)
++
++        return _hook
++
++
++class HistogramCollector:
++    def __init__(
++        self,
++        max_abs: dict[tuple[int, str, str], float],
++        bins: int,
++    ) -> None:
++        self.bins = bins
++        self.ranges = {
++            key: max(value * 1.001, 1e-6) for key, value in max_abs.items()
++        }
++        self.counts = {
++            key: torch.zeros(bins, dtype=torch.float32) for key in max_abs
++        }
++        self.tokens = {key: 0 for key in max_abs}
++
++    def centers(self, key: tuple[int, str, str]) -> torch.Tensor:
++        edge = self.ranges[key]
++        width = (2.0 * edge) / self.bins
++        return torch.linspace(
++            -edge + width / 2.0,
++            edge - width / 2.0,
++            self.bins,
++            dtype=torch.float32,
++        )
++
++    def hook(self, layer_idx: int, part: str, hidden_type: str):
++        key = site_key(layer_idx, part, hidden_type)
++
++        def _hook(module: torch.nn.Module, inputs: tuple[Any, ...]) -> None:
++            del module
++            x = inputs[0].detach().reshape(-1).to(dtype=torch.float32)
++            edge = self.ranges[key]
++            hist = torch.histc(x, bins=self.bins, min=-edge, max=edge)
++            self.counts[key].add_(hist.to(device="cpu", dtype=torch.float32))
++            self.tokens[key] += int(x.numel())
++
++        return _hook
++
++
++def install_hooks(model: torch.nn.Module, collector: Any) -> list[Any]:
++    handles: list[Any] = []
++    for layer_idx, layer in enumerate(model.model.layers):
++        handles.append(
++            layer.self_attn.q_proj.register_forward_pre_hook(
++                collector.hook(layer_idx, "self_attn", "h1")
++            )
++        )
++        handles.append(
++            layer.self_attn.o_proj.register_forward_pre_hook(
++                collector.hook(layer_idx, "self_attn", "h2")
++            )
++        )
++        handles.append(
++            layer.mlp.gate_proj.register_forward_pre_hook(
++                collector.hook(layer_idx, "mlp", "h1")
++            )
++        )
++        handles.append(
++            layer.mlp.down_proj.register_forward_pre_hook(
++                collector.hook(layer_idx, "mlp", "h2")
++            )
++        )
++    return handles
++
++
++def remove_hooks(handles: list[Any]) -> None:
++    for handle in handles:
++        handle.remove()
++
++
++def run_windows(
++    model: torch.nn.Module,
++    windows: list[list[int]],
++    batch_size: int,
++    device: torch.device,
++    desc: str,
++) -> None:
++    for start in tqdm(range(0, len(windows), batch_size), desc=desc):
++        batch = windows[start : start + batch_size]
++        input_ids = torch.tensor(batch, dtype=torch.long, device=device)
++        with torch.inference_mode():
++            model(input_ids=input_ids, use_cache=False)
++        del input_ids
++
++
++def official_icdf_from_counts(
++    centers: torch.Tensor,
++    counts: torch.Tensor,
++    sparsity: float,
++) -> torch.Tensor:
++    total_count = counts.sum()
++    cumulative_counts = torch.cumsum(counts, dim=0)
++    target_count = (0.5 + sparsity / 2.0) * total_count
++    idx = torch.searchsorted(cumulative_counts, target_count)
++
++    if idx == 0:
++        value = centers[0]
++    elif idx == len(centers):
++        value = centers[-1]
++    else:
++        lower_count = cumulative_counts[idx - 1]
++        upper_count = cumulative_counts[idx]
++        lower_value = centers[idx - 1]
++        upper_value = centers[idx]
++        denom = upper_count - lower_count
++        if denom.abs() < 1e-12:
++            value = lower_value
++        else:
++            fraction = (target_count - lower_count) / denom
++            value = lower_value + fraction * (upper_value - lower_value)
++    return value.detach().cpu().to(torch.float32).reshape(())
++
++
++def save_artifacts(
++    collector: HistogramCollector,
++    output_path: Path,
++    num_layers: int,
++    sparsity: float,
++) -> dict[str, Any]:
++    hist_root = output_path / "official_histograms"
++    threshold_root = output_path / "thresholds"
++    threshold_root.mkdir(parents=True, exist_ok=True)
++    metadata: dict[str, Any] = {"layers": {}, "thresholds": {}}
++
++    for layer_idx in range(num_layers):
++        metadata["layers"][str(layer_idx)] = {}
++        for part in ("self_attn", "mlp"):
++            part_dir = hist_root / f"layer-{layer_idx}" / part
++            part_dir.mkdir(parents=True, exist_ok=True)
++            payload = {}
++            for hidden_type in ("h1", "h2"):
++                key = site_key(layer_idx, part, hidden_type)
++                centers = collector.centers(key)
++                counts = collector.counts[key]
++                payload[f"{hidden_type}_centers"] = centers
++                payload[hidden_type] = counts
++                metadata["layers"][str(layer_idx)][f"{part}.{hidden_type}"] = {
++                    "tokens": collector.tokens[key],
++                    "bins": collector.bins,
++                    "range": collector.ranges[key],
++                    "count": float(counts.sum().item()),
++                }
++            torch.save(payload, part_dir / "histograms.pt")
++
++        for projection, (part, hidden_type) in PROJECTION_THRESHOLDS.items():
++            key = site_key(layer_idx, part, hidden_type)
++            threshold = official_icdf_from_counts(
++                collector.centers(key),
++                collector.counts[key],
++                sparsity,
++            )
++            filename = f"layers.{layer_idx}.{projection}.threshold.pt"
++            torch.save(threshold, threshold_root / filename)
++            metadata["thresholds"][filename] = float(threshold.item())
++
++    (output_path / "activation_sparsity_config.json").write_text(
++        json.dumps(
++            {
++                "enable": True,
++                "method": "teal",
++                "uniform_sparsity": sparsity,
++                "calibration_path": str(threshold_root.resolve()),
++                "decode_only": False,
++                "apply_all_tokens": False,
++                "prefill_sparsify": "half",
++                "strict_unsupported_check": True,
++                "use_sparse_gemv": False,
++            },
++            indent=2,
++        )
++        + "\n"
++    )
++    return metadata
++
++
++def main() -> int:
++    args = parse_args()
++    if not math.isfinite(args.sparsity) or not 0.0 <= args.sparsity <= 1.0:
++        raise ValueError(f"--sparsity must be in [0, 1], got {args.sparsity}")
++
++    args.output_path = args.output_path.resolve()
++    device = resolve_device(args.device)
++
++    from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
++
++    config = AutoConfig.from_pretrained(args.model, trust_remote_code=True)
++    if getattr(config, "model_type", None) != "qwen2":
++        raise ValueError(
++            "This capture script is intended for Qwen2/Qwen2.5 models; "
++            f"got model_type={getattr(config, 'model_type', None)!r}."
++        )
++
++    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
++    if tokenizer.pad_token_id is None:
++        tokenizer.pad_token_id = (
++            tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0
++        )
++
++    texts = load_texts(args)
++    windows = build_token_windows(
++        tokenizer,
++        texts,
++        args.sequence_length,
++        args.max_sequences,
++    )
++    print(
++        "setup: "
++        f"model={args.model}, device={device}, dtype={args.dtype}, "
++        f"sequence_length={args.sequence_length}, sequences={len(windows)}, "
++        f"bins={args.histogram_bins}, output_path={args.output_path}"
++    )
++
++    model = AutoModelForCausalLM.from_pretrained(
++        args.model,
++        torch_dtype=torch_dtype(args.dtype),
++        trust_remote_code=True,
++        attn_implementation=args.attn_implementation,
++        low_cpu_mem_usage=True,
++    )
++    model.eval()
++    model.to(device)
++    model.config.use_cache = False
++
++    range_collector = RangeCollector(num_layers=int(config.num_hidden_layers))
++    handles = install_hooks(model, range_collector)
++    try:
++        run_windows(model, windows, args.batch_size, device, "capture TEAL ranges")
++    finally:
++        remove_hooks(handles)
++
++    histogram_collector = HistogramCollector(
++        range_collector.max_abs,
++        bins=args.histogram_bins,
++    )
++    handles = install_hooks(model, histogram_collector)
++    try:
++        run_windows(model, windows, args.batch_size, device, "capture TEAL histograms")
++    finally:
++        remove_hooks(handles)
++
++    args.output_path.mkdir(parents=True, exist_ok=True)
++    metadata = save_artifacts(
++        histogram_collector,
++        args.output_path,
++        num_layers=int(config.num_hidden_layers),
++        sparsity=args.sparsity,
++    )
++    metadata.update(
++        {
++            "model": args.model,
++            "model_type": config.model_type,
++            "sparsity": args.sparsity,
++            "dataset": {
++                "name": args.dataset_name,
++                "subset": args.dataset_subset,
++                "split": args.dataset_split,
++                "size": args.dataset_size,
++                "sample": args.dataset_sample,
++                "seed": args.dataset_seed,
++                "text_file": str(args.text_file) if args.text_file else None,
++            },
++            "sequence_length": args.sequence_length,
++            "batch_size": args.batch_size,
++            "sequences": len(windows),
++            "dtype": args.dtype,
++            "device": str(device),
++            "histogram_bins": args.histogram_bins,
++        }
++    )
++    (args.output_path / "teal_histogram_metadata.json").write_text(
++        json.dumps(metadata, indent=2) + "\n"
++    )
++
++    del model
++    gc.collect()
++    empty_device_cache(device)
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/scripts/eval_larosa_ppl_alignment.py b/scripts/eval_larosa_ppl_alignment.py
+new file mode 100644
+index 00000000000..073b824b007
+--- /dev/null
++++ b/scripts/eval_larosa_ppl_alignment.py
+@@ -0,0 +1,616 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Evaluate La RoSA PPL alignment between HF reference hooks and vLLM.
++
++The HF hook path mirrors Alibaba EfficientAI La RoSA inference:
++
++* q/k/v and gate/up inputs use ``x @ Q -> top_k_new -> x @ Q.T`` with
++  ``sparse_level_h1 = sparsity * 0.8``.
++* o/down inputs use direct ``top_k_new`` with
++  ``sparse_level_h2 = sparsity * 1.2``.
++
++Calibration artifacts follow the official layout:
++``{calibration_path}/histograms/layer-{idx}/self_attn/D.pt``.
++"""
++
++from __future__ import annotations
++
++import argparse
++import gc
++import json
++import math
++import os
++import sys
++import tempfile
++from pathlib import Path
++from typing import Any
++
++import torch
++
++SCRIPT_DIR = Path(__file__).resolve().parent
++if str(SCRIPT_DIR) not in sys.path:
++    sys.path.insert(0, str(SCRIPT_DIR))
++
++from eval_teal_ppl_alignment import (  # noqa: E402
++    BackendComparison,
++    assert_alignment,
++    build_eval_ids,
++    build_vllm,
++    comparison_payload,
++    empty_backend_cache,
++    iter_windows,
++    load_texts,
++    load_tokenizer,
++    print_comparison,
++    score_hf_windows,
++    score_vllm_windows,
++    summarize_sparse_kernel_markers,
++    torch_dtype,
++    validate_required_sparse_kernel_markers,
++)  # isort: skip
++
++DEFAULT_MODEL = "Qwen/Qwen2.5-7B"
++SUPPORTED_MODEL_TYPES = {"llama": "Llama2/3", "qwen2": "Qwen2/2.5"}
++
++
++def parse_args() -> argparse.Namespace:
++    parser = argparse.ArgumentParser(
++        description=(
++            "Evaluate La RoSA dense/sparse PPL deltas for vLLM and an "
++            "HF reference implementation aligned to Alibaba EfficientAI."
++        )
++    )
++    parser.add_argument("--model", default=DEFAULT_MODEL)
++    parser.add_argument("--sparsity", type=float, default=0.5)
++    parser.add_argument(
++        "--calibration-path",
++        type=Path,
++        required=True,
++        help=(
++            "La RoSA calibration root containing "
++            "histograms/layer-{idx}/self_attn/D.pt."
++        ),
++    )
++    parser.add_argument(
++        "--larosa-repo-path",
++        type=Path,
++        default=None,
++        help=(
++            "Optional Alibaba EfficientAI checkout. Used only with "
++            "--hf-reference-impl official_repo."
++        ),
++    )
++
++    dataset = parser.add_argument_group("dataset")
++    dataset.add_argument("--dataset-name", default="wikitext")
++    dataset.add_argument("--dataset-subset", default="wikitext-2-raw-v1")
++    dataset.add_argument("--dataset-split", default="test")
++    dataset.add_argument("--dataset-text-field", default="text")
++    dataset.add_argument("--dataset-size", type=int, default=250)
++    dataset.add_argument(
++        "--dataset-sample",
++        choices=["first", "random"],
++        default="random",
++        help="Select the first N rows or a seeded random subset for evaluation.",
++    )
++    dataset.add_argument("--dataset-seed", type=int, default=0)
++    dataset.add_argument("--text-file", type=Path, default=None)
++    dataset.add_argument("--inline-text", action="append", default=None)
++
++    ppl = parser.add_argument_group("ppl windowing")
++    ppl.add_argument("--context-size", type=int, default=2048)
++    ppl.add_argument("--window-size", type=int, default=512)
++    ppl.add_argument("--max-windows", type=int, default=None)
++
++    backends = parser.add_argument_group("backends")
++    backends.add_argument(
++        "--backend",
++        choices=["both", "hf", "vllm"],
++        default="both",
++    )
++    backends.add_argument(
++        "--hf-reference-impl",
++        choices=["hooks", "official_repo"],
++        default="hooks",
++        help=(
++            "hooks uses local hooks that mirror the official La RoSA math; "
++            "official_repo imports Alibaba EfficientAI modeling_*_larosa.py."
++        ),
++    )
++    backends.add_argument(
++        "--vllm-use-sparse-gemv",
++        action=argparse.BooleanOptionalAction,
++        default=False,
++        help=(
++            "Enable the backend sparse GEMV kernel in the vLLM sparse run. "
++            "This should be used only when the target plugin provides the "
++            "activation_sparse_linear custom op."
++        ),
++    )
++    backends.add_argument(
++        "--vllm-allow-sparse-gemv-fallback",
++        action="store_true",
++        help=(
++            "Allow dense masked fallback when --vllm-use-sparse-gemv is set "
++            "but the backend kernel is unavailable. Leave unset for "
++            "kernel-backed evidence runs."
++        ),
++    )
++
++    runtime = parser.add_argument_group("runtime")
++    runtime.add_argument(
++        "--dtype",
++        choices=["float16", "bfloat16", "float32"],
++        default="bfloat16",
++    )
++    runtime.add_argument(
++        "--rotation-dtype",
++        choices=["float32"],
++        default="float32",
++        help="Compute dtype for La RoSA rotation/unrotation in the HF hook path.",
++    )
++    runtime.add_argument("--device", default="cuda")
++    runtime.add_argument(
++        "--hf-attn-implementation",
++        default="eager",
++        choices=["eager", "sdpa", "flash_attention_2"],
++        help=(
++            "HF attention implementation. The hook path defaults to eager; "
++            "official La RoSA scripts commonly use flash_attention_2."
++        ),
++    )
++    runtime.add_argument("--vllm-max-model-len", type=int, default=None)
++    runtime.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.75)
++    runtime.add_argument(
++        "--vllm-enforce-eager",
++        action=argparse.BooleanOptionalAction,
++        default=True,
++    )
++    runtime.add_argument("--vllm-shutdown-timeout", type=int, default=30)
++
++    alignment = parser.add_argument_group("alignment")
++    alignment.add_argument("--delta-nll-atol", type=float, default=2e-3)
++    alignment.add_argument("--delta-nll-rtol", type=float, default=2e-2)
++    alignment.add_argument("--fail-on-mismatch", action="store_true")
++    alignment.add_argument("--json-output", type=Path, default=None)
++
++    return parser.parse_args()
++
++
++def get_model_config(args: argparse.Namespace) -> Any:
++    from transformers import AutoConfig
++
++    return AutoConfig.from_pretrained(args.model, trust_remote_code=True)
++
++
++def resolve_model_type(config: Any) -> str:
++    model_type = getattr(config, "model_type", None)
++    if model_type in SUPPORTED_MODEL_TYPES:
++        return model_type
++    raise ValueError(
++        "La RoSA official support in this vLLM path is limited to "
++        f"{', '.join(SUPPORTED_MODEL_TYPES.values())}; got model_type={model_type!r}."
++    )
++
++
++def rotation_path(calibration_path: Path, layer_idx: int) -> Path:
++    return calibration_path / "histograms" / f"layer-{layer_idx}" / "self_attn" / "D.pt"
++
++
++def validate_calibration_artifacts(
++    calibration_path: Path,
++    num_layers: int,
++) -> None:
++    missing = [
++        str(rotation_path(calibration_path, layer_idx))
++        for layer_idx in range(num_layers)
++        if not rotation_path(calibration_path, layer_idx).exists()
++    ]
++    if missing:
++        preview = "\n".join(missing[:8])
++        raise FileNotFoundError(
++            "Missing official La RoSA rotation artifacts. Expected one "
++            "D.pt per layer under "
++            f"{calibration_path}/histograms/layer-*/self_attn/.\n"
++            f"Missing examples:\n{preview}"
++        )
++
++
++def official_topk_new(x: torch.Tensor, sparsity_level: float) -> torch.Tensor:
++    if sparsity_level <= 0.0:
++        return x
++    if sparsity_level >= 1.0:
++        raise ValueError(
++            "La RoSA sparsity_level must be lower than 1.0, "
++            f"got {sparsity_level}."
++        )
++    keep = int((1.0 - sparsity_level) * x.shape[-1])
++    if keep < 1:
++        raise ValueError(
++            "La RoSA top-k would keep fewer than one activation: "
++            f"hidden_size={x.shape[-1]}, sparsity_level={sparsity_level}."
++        )
++    topk_values, _ = torch.topk(torch.abs(x), keep, dim=-1)
++    mask = torch.ge(torch.abs(x), topk_values[..., -1:])
++    return mask * x
++
++
++class HFLarosaReference:
++    """Forward-hook HF reference for official La RoSA runtime sparsity."""
++
++    def __init__(
++        self,
++        model: torch.nn.Module,
++        calibration_path: Path,
++        rotation_dtype: torch.dtype,
++    ) -> None:
++        self.model = model
++        self.calibration_path = calibration_path
++        self.rotation_dtype = rotation_dtype
++        self.sparsity = 0.0
++        self.rotations: dict[int, torch.Tensor] = {}
++        self.handles: list[Any] = []
++        self._install_hooks()
++
++    def set_sparsity(self, sparsity: float) -> None:
++        self.sparsity = float(sparsity)
++
++    @property
++    def sparse_level_h1(self) -> float:
++        return self.sparsity * 0.8
++
++    @property
++    def sparse_level_h2(self) -> float:
++        return self.sparsity * 1.2
++
++    def _install_hooks(self) -> None:
++        layers = self.model.model.layers
++        for layer_idx, layer in enumerate(layers):
++            q = torch.load(
++                rotation_path(self.calibration_path, layer_idx),
++                map_location="cpu",
++                weights_only=True,
++            )
++            self.rotations[layer_idx] = q.to(dtype=self.rotation_dtype)
++
++            for module in (
++                layer.self_attn.q_proj,
++                layer.self_attn.k_proj,
++                layer.self_attn.v_proj,
++                layer.mlp.gate_proj,
++                layer.mlp.up_proj,
++            ):
++                self.handles.append(
++                    module.register_forward_pre_hook(
++                        self._make_h1_hook(layer_idx),
++                    )
++                )
++
++            for module in (layer.self_attn.o_proj, layer.mlp.down_proj):
++                self.handles.append(
++                    module.register_forward_pre_hook(self._make_h2_hook())
++                )
++
++    def _make_h1_hook(self, layer_idx: int):
++        def hook(module: torch.nn.Module, inputs: tuple[Any, ...]) -> tuple[Any, ...]:
++            del module
++            if self.sparse_level_h1 <= 0.0:
++                return inputs
++            x = inputs[0]
++            q = self.rotations[layer_idx].to(device=x.device)
++            rot_x = torch.matmul(x.to(dtype=q.dtype), q)
++            sparse_rot_x = official_topk_new(rot_x, self.sparse_level_h1)
++            topk_x = torch.matmul(sparse_rot_x, q.t()).to(dtype=x.dtype)
++            return (topk_x, *inputs[1:])
++
++        return hook
++
++    def _make_h2_hook(self):
++        def hook(module: torch.nn.Module, inputs: tuple[Any, ...]) -> tuple[Any, ...]:
++            del module
++            if self.sparse_level_h2 <= 0.0:
++                return inputs
++            x = inputs[0]
++            return (official_topk_new(x, self.sparse_level_h2), *inputs[1:])
++
++        return hook
++
++
++def load_hf_model(args: argparse.Namespace) -> torch.nn.Module:
++    from transformers import AutoModelForCausalLM
++
++    model = AutoModelForCausalLM.from_pretrained(
++        args.model,
++        torch_dtype=torch_dtype(args.dtype),
++        trust_remote_code=True,
++        attn_implementation=args.hf_attn_implementation,
++        low_cpu_mem_usage=True,
++    )
++    model.to(args.device)
++
++    model_vocab_size = model.get_input_embeddings().weight.size(0)
++    tokenizer_vocab_size = len(load_tokenizer(args.model))
++    if model_vocab_size != tokenizer_vocab_size:
++        model.resize_token_embeddings(tokenizer_vocab_size)
++    return model
++
++
++def build_official_larosa_model(
++    args: argparse.Namespace,
++    model_type: str,
++) -> torch.nn.Module:
++    if args.larosa_repo_path is None:
++        raise ValueError(
++            "--hf-reference-impl official_repo requires --larosa-repo-path."
++        )
++
++    larosa_root = args.larosa_repo_path.resolve()
++    sys.path.insert(0, str(larosa_root))
++
++    from transformers import AutoConfig
++
++    if model_type == "llama":
++        from inference.modeling_llama_larosa import (  # type: ignore[import-not-found]
++            LlamaForCausalLM,
++        )
++
++        model_cls = LlamaForCausalLM
++    elif model_type == "qwen2":
++        from inference.modeling_qwen2_larosa import (  # type: ignore[import-not-found]
++            Qwen2ForCausalLM,
++        )
++
++        model_cls = Qwen2ForCausalLM
++    else:
++        raise ValueError(f"Unsupported La RoSA model_type={model_type!r}.")
++
++    config = AutoConfig.from_pretrained(args.model, trust_remote_code=True)
++    config.use_cache = False
++    config._attn_implementation = args.hf_attn_implementation
++    config.torch_dtype = args.dtype
++    config.sparse_level = args.sparsity
++    config.Q_path = str(args.calibration_path.resolve())
++
++    model = model_cls.from_pretrained(
++        args.model,
++        torch_dtype=torch_dtype(args.dtype),
++        config=config,
++        trust_remote_code=True,
++    )
++    model.to(args.device)
++    return model
++
++
++def set_official_model_sparsity(model: torch.nn.Module, sparsity: float) -> None:
++    for layer in model.model.layers:
++        layer.self_attn.sparse_level_h1 = sparsity * 0.8
++        layer.self_attn.sparse_level_h2 = sparsity * 1.2
++        layer.mlp.sparse_level_h1 = sparsity * 0.8
++        layer.mlp.sparse_level_h2 = sparsity * 1.2
++
++
++def run_hf_reference(
++    args: argparse.Namespace,
++    windows: list[list[int]],
++    model_type: str,
++) -> BackendComparison:
++    if args.hf_reference_impl == "official_repo":
++        model = build_official_larosa_model(args, model_type)
++        set_official_model_sparsity(model, 0.0)
++        reference_name = "official_repo"
++    else:
++        model = load_hf_model(args)
++        larosa_ref = HFLarosaReference(
++            model,
++            args.calibration_path,
++            torch_dtype(args.rotation_dtype),
++        )
++        larosa_ref.set_sparsity(0.0)
++        reference_name = "hooks"
++
++    dense = score_hf_windows(
++        model,
++        windows,
++        args.window_size,
++        args.device,
++        desc=f"HF dense ({reference_name})",
++    )
++
++    if args.hf_reference_impl == "official_repo":
++        set_official_model_sparsity(model, args.sparsity)
++    else:
++        larosa_ref.set_sparsity(args.sparsity)
++
++    sparse = score_hf_windows(
++        model,
++        windows,
++        args.window_size,
++        args.device,
++        desc=f"HF La RoSA sparse s={args.sparsity}",
++    )
++
++    del model
++    gc.collect()
++    empty_backend_cache()
++
++    return BackendComparison(
++        backend=f"hf_larosa:{reference_name}:all_tokens",
++        dense=dense,
++        sparse=sparse,
++    )
++
++
++def run_vllm_reference(
++    args: argparse.Namespace,
++    windows: list[list[int]],
++) -> BackendComparison:
++    dense_llm = build_vllm(args, None)
++    dense = score_vllm_windows(
++        dense_llm,
++        windows,
++        args.window_size,
++        desc="vLLM dense",
++    )
++    del dense_llm
++    gc.collect()
++    empty_backend_cache()
++
++    sparsity_config = {
++        "enable": True,
++        "method": "larosa",
++        "uniform_sparsity": args.sparsity,
++        "calibration_path": str(args.calibration_path.resolve()),
++        "decode_only": False,
++        "apply_all_tokens": True,
++        "prefill_sparsify": "all",
++        "strict_unsupported_check": True,
++        "use_sparse_gemv": args.vllm_use_sparse_gemv,
++    }
++    previous_require_kernel = os.environ.get("VLLM_SPARSE_GEMV_REQUIRE_KERNEL")
++    previous_sparse_marker_path = os.environ.get("VLLM_SPARSE_GEMV_MARKER_PATH")
++    previous_ascend_marker_path = os.environ.get(
++        "VLLM_ASCEND_SPARSE_LINEAR_MARKER_PATH"
++    )
++    marker_tmpdir: tempfile.TemporaryDirectory[str] | None = None
++    marker_summary: dict[str, Any] | None = None
++    if args.vllm_use_sparse_gemv:
++        os.environ["VLLM_SPARSE_GEMV_REQUIRE_KERNEL"] = (
++            "0" if args.vllm_allow_sparse_gemv_fallback else "1"
++        )
++        marker_tmpdir = tempfile.TemporaryDirectory(prefix="vllm_ppl_sparse_gemv_")
++        sparse_marker_path = Path(marker_tmpdir.name) / "invocations.jsonl"
++        ascend_marker_path = Path(marker_tmpdir.name) / "ascend_custom_ops.jsonl"
++        os.environ["VLLM_SPARSE_GEMV_MARKER_PATH"] = str(sparse_marker_path)
++        os.environ["VLLM_ASCEND_SPARSE_LINEAR_MARKER_PATH"] = str(ascend_marker_path)
++    try:
++        sparse_llm = build_vllm(args, sparsity_config)
++        sparse = score_vllm_windows(
++            sparse_llm,
++            windows,
++            args.window_size,
++            desc=f"vLLM La RoSA sparse s={args.sparsity}",
++        )
++        del sparse_llm
++        gc.collect()
++        empty_backend_cache()
++        if marker_tmpdir is not None:
++            marker_summary = summarize_sparse_kernel_markers(
++                sparse_marker_path,
++                ascend_marker_path,
++            )
++            if not args.vllm_allow_sparse_gemv_fallback:
++                validate_required_sparse_kernel_markers(marker_summary)
++    finally:
++        if previous_require_kernel is None:
++            os.environ.pop("VLLM_SPARSE_GEMV_REQUIRE_KERNEL", None)
++        else:
++            os.environ["VLLM_SPARSE_GEMV_REQUIRE_KERNEL"] = (
++                previous_require_kernel
++            )
++        if previous_sparse_marker_path is None:
++            os.environ.pop("VLLM_SPARSE_GEMV_MARKER_PATH", None)
++        else:
++            os.environ["VLLM_SPARSE_GEMV_MARKER_PATH"] = previous_sparse_marker_path
++        if previous_ascend_marker_path is None:
++            os.environ.pop("VLLM_ASCEND_SPARSE_LINEAR_MARKER_PATH", None)
++        else:
++            os.environ["VLLM_ASCEND_SPARSE_LINEAR_MARKER_PATH"] = (
++                previous_ascend_marker_path
++            )
++        if marker_tmpdir is not None:
++            marker_tmpdir.cleanup()
++
++    return BackendComparison(
++        backend=(
++            "vllm_larosa:official_topk:all_tokens:"
++            f"use_sparse_gemv={args.vllm_use_sparse_gemv}"
++        ),
++        dense=dense,
++        sparse=sparse,
++        sparse_kernel_markers=marker_summary,
++    )
++
++
++def main() -> int:
++    args = parse_args()
++    args.calibration_path = args.calibration_path.resolve()
++
++    if args.sparsity < 0.0 or args.sparsity >= 1.0:
++        raise ValueError("--sparsity must be in [0, 1).")
++    if args.sparsity * 1.2 >= 1.0:
++        raise ValueError(
++            "Official La RoSA h2 sparsity is sparsity * 1.2 and must be < 1. "
++            f"Got sparsity={args.sparsity}."
++        )
++
++    config = get_model_config(args)
++    model_type = resolve_model_type(config)
++    num_layers = int(config.num_hidden_layers)
++    validate_calibration_artifacts(args.calibration_path, num_layers)
++
++    tokenizer = load_tokenizer(args.model)
++    texts = load_texts(args)
++    token_ids = build_eval_ids(tokenizer, texts, args.window_size)
++    windows = iter_windows(
++        token_ids,
++        args.context_size,
++        args.window_size,
++        args.max_windows,
++    )
++
++    print(
++        "setup: "
++        f"model={args.model}, model_type={model_type}, "
++        f"sparsity={args.sparsity}, windows={len(windows)}, "
++        f"tokens={len(token_ids)}, calibration_path={args.calibration_path}"
++    )
++
++    hf_result = None
++    vllm_result = None
++    if args.backend in {"both", "hf"}:
++        hf_result = run_hf_reference(args, windows, model_type)
++        print_comparison(hf_result)
++    if args.backend in {"both", "vllm"}:
++        vllm_result = run_vllm_reference(args, windows)
++        print_comparison(vllm_result)
++
++    aligned = assert_alignment(hf_result, vllm_result, args)
++
++    if args.json_output:
++        payload = {
++            "setup": {
++                "model": args.model,
++                "model_type": model_type,
++                "official_supported_family": SUPPORTED_MODEL_TYPES[model_type],
++                "sparsity": args.sparsity,
++                "context_size": args.context_size,
++                "window_size": args.window_size,
++                "tokens": len(token_ids),
++                "windows": len(windows),
++                "hf_reference_impl": args.hf_reference_impl,
++                "rotation_dtype": args.rotation_dtype,
++                "calibration_path": str(args.calibration_path),
++            },
++            "hf": comparison_payload(hf_result),
++            "vllm": comparison_payload(vllm_result),
++            "aligned": aligned,
++        }
++        args.json_output.parent.mkdir(parents=True, exist_ok=True)
++        args.json_output.write_text(json.dumps(payload, indent=2) + "\n")
++
++    if not aligned and args.fail_on_mismatch:
++        return 2
++    if (
++        hf_result is not None
++        and vllm_result is not None
++        and math.copysign(1.0, hf_result.delta_nll)
++        != math.copysign(1.0, vllm_result.delta_nll)
++    ):
++        print(
++            "warning: HF and vLLM PPL deltas have different signs; "
++            "inspect calibration artifacts and model/runtime parity."
++        )
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/scripts/eval_teal_ppl_alignment.py b/scripts/eval_teal_ppl_alignment.py
+index 51ed19521e3..5643c9d8ae3 100644
+--- a/scripts/eval_teal_ppl_alignment.py
++++ b/scripts/eval_teal_ppl_alignment.py
+@@ -23,7 +23,9 @@ import argparse
+ import gc
+ import json
+ import math
++import os
+ import sys
++import tempfile
+ from collections.abc import Iterable
+ from dataclasses import asdict, dataclass
+ from pathlib import Path
+@@ -57,6 +59,7 @@ class BackendComparison:
+     backend: str
+     dense: PPLStats
+     sparse: PPLStats
++    sparse_kernel_markers: dict[str, Any] | None = None
+ 
+     @property
+     def delta_nll(self) -> float:
+@@ -120,13 +123,20 @@ def parse_args() -> argparse.Namespace:
+         "--dataset-name",
+         default=None,
+         help=(
+-            "HF dataset name. For the official paper-style smoke, use tatsu-lab/alpaca."
++            "HF dataset name. For a paper-style sampled subset, use tatsu-lab/alpaca."
+         ),
+     )
+     dataset.add_argument("--dataset-subset", default=None)
+     dataset.add_argument("--dataset-split", default="train")
+     dataset.add_argument("--dataset-text-field", default="text")
+     dataset.add_argument("--dataset-size", type=int, default=250)
++    dataset.add_argument(
++        "--dataset-sample",
++        choices=["first", "random"],
++        default="first",
++        help="Select the first N rows or a seeded random subset for evaluation.",
++    )
++    dataset.add_argument("--dataset-seed", type=int, default=0)
+     dataset.add_argument(
+         "--text-file",
+         type=Path,
+@@ -147,7 +157,10 @@ def parse_args() -> argparse.Namespace:
+         "--max-windows",
+         type=int,
+         default=None,
+-        help="Limit windows for smoke tests. Full eval should leave this unset.",
++        help=(
++            "Limit windows for sampled subset checks. Full eval should leave "
++            "this unset."
++        ),
+     )
+ 
+     backends = parser.add_argument_group("backends")
+@@ -185,6 +198,25 @@ def parse_args() -> argparse.Namespace:
+             "sparsifies every token, none sparsifies decode tokens only."
+         ),
+     )
++    backends.add_argument(
++        "--vllm-use-sparse-gemv",
++        action=argparse.BooleanOptionalAction,
++        default=False,
++        help=(
++            "Enable the backend sparse GEMV kernel in the vLLM sparse run. "
++            "This should be used only when the target plugin provides the "
++            "activation_sparse_linear custom op."
++        ),
++    )
++    backends.add_argument(
++        "--vllm-allow-sparse-gemv-fallback",
++        action="store_true",
++        help=(
++            "Allow dense masked fallback when --vllm-use-sparse-gemv is set "
++            "but the backend kernel is unavailable. Leave unset for "
++            "kernel-backed evidence runs."
++        ),
++    )
+     backends.add_argument(
+         "--hf-attn-implementation",
+         default="sdpa",
+@@ -243,6 +275,19 @@ def torch_dtype(name: str) -> torch.dtype:
+     }[name]
+ 
+ 
++def empty_backend_cache() -> None:
++    if torch.cuda.is_available():
++        torch.cuda.empty_cache()
++    npu = getattr(torch, "npu", None)
++    if npu is None:
++        return
++    try:
++        if npu.is_available():
++            npu.empty_cache()
++    except RuntimeError:
++        pass
++
++
+ def load_tokenizer(model: str):
+     from transformers import AutoTokenizer
+ 
+@@ -281,7 +326,13 @@ def load_texts(args: argparse.Namespace) -> list[str]:
+             split=args.dataset_split,
+         )
+         if args.dataset_size is not None:
+-            dataset = dataset.select(range(min(args.dataset_size, len(dataset))))
++            size = min(args.dataset_size, len(dataset))
++            if getattr(args, "dataset_sample", "first") == "random":
++                dataset = dataset.shuffle(
++                    seed=getattr(args, "dataset_seed", 0)
++                ).select(range(size))
++            else:
++                dataset = dataset.select(range(size))
+         return [str(sample[args.dataset_text_field]) for sample in dataset]
+ 
+     return [
+@@ -736,8 +787,7 @@ def run_hf_reference(
+ 
+     del model
+     gc.collect()
+-    if torch.cuda.is_available():
+-        torch.cuda.empty_cache()
++    empty_backend_cache()
+     return BackendComparison(
+         backend=f"hf_reference:{args.hf_reference_impl}:{args.hf_reference_mode}",
+         dense=dense,
+@@ -826,6 +876,128 @@ def build_vllm(
+     return LLM(**kwargs)
+ 
+ 
++def read_marker_records(marker_path: Path) -> list[dict[str, Any]]:
++    if not marker_path.exists():
++        return []
++    records = []
++    for line in marker_path.read_text(encoding="utf-8").splitlines():
++        if not line:
++            continue
++        records.append(json.loads(line))
++    return records
++
++
++def unique_marker_values(
++    records: list[dict[str, Any]],
++    key: str,
++) -> list[Any]:
++    values: list[Any] = []
++    seen: set[str] = set()
++    for record in records:
++        if key not in record:
++            continue
++        value = record[key]
++        marker = json.dumps(value, sort_keys=True)
++        if marker in seen:
++            continue
++        seen.add(marker)
++        values.append(value)
++    return values
++
++
++def summarize_sparse_kernel_markers(
++    sparse_marker_path: Path,
++    ascend_marker_path: Path,
++) -> dict[str, Any]:
++    sparse_records = read_marker_records(sparse_marker_path)
++    ascend_records = read_marker_records(ascend_marker_path)
++    summary: dict[str, Any] = {
++        "sparse_gemv_marker_records": len(sparse_records),
++        "sparse_gemv_marker_pids": sorted(
++            {
++                int(record["pid"])
++                for record in sparse_records
++                if "pid" in record
++            }
++        ),
++        "sparse_gemv_marker_x_shapes": unique_marker_values(
++            sparse_records,
++            "x_shape",
++        ),
++        "sparse_gemv_marker_threshold_shapes": unique_marker_values(
++            sparse_records,
++            "threshold_shape",
++        ),
++        "sparse_gemv_marker_threshold_numels": unique_marker_values(
++            sparse_records,
++            "threshold_numel",
++        ),
++        "sparse_gemv_marker_inclusive": unique_marker_values(
++            sparse_records,
++            "inclusive",
++        ),
++        "sparse_gemv_marker_weight_t_provided": unique_marker_values(
++            sparse_records,
++            "weight_t_provided",
++        ),
++        "ascend_sparse_linear_marker_records": len(ascend_records),
++        "ascend_sparse_linear_marker_pids": sorted(
++            {
++                int(record["pid"])
++                for record in ascend_records
++                if "pid" in record
++            }
++        ),
++        "ascend_sparse_linear_marker_ops": sorted(
++            {
++                str(record["op"])
++                for record in ascend_records
++                if "op" in record
++            }
++        ),
++        "ascend_sparse_linear_marker_x_shapes": unique_marker_values(
++            ascend_records,
++            "x_shape",
++        ),
++        "ascend_sparse_linear_marker_threshold_shapes": unique_marker_values(
++            ascend_records,
++            "threshold_shape",
++        ),
++        "ascend_sparse_linear_marker_threshold_numels": unique_marker_values(
++            ascend_records,
++            "threshold_numel",
++        ),
++        "ascend_sparse_linear_marker_inclusive": unique_marker_values(
++            ascend_records,
++            "inclusive",
++        ),
++        "ascend_sparse_linear_marker_weight_t_provided": unique_marker_values(
++            ascend_records,
++            "weight_t_provided",
++        ),
++    }
++    return summary
++
++
++def validate_required_sparse_kernel_markers(
++    marker_summary: dict[str, Any] | None,
++) -> None:
++    if marker_summary is None:
++        raise RuntimeError("sparse kernel marker summary was not collected.")
++    if marker_summary["sparse_gemv_marker_records"] <= 0:
++        raise RuntimeError("vLLM sparse GEMV marker records are missing.")
++    if marker_summary["ascend_sparse_linear_marker_records"] <= 0:
++        raise RuntimeError("Ascend sparse linear marker records are missing.")
++    if (
++        "activation_sparse_linear_packed_t"
++        not in marker_summary["ascend_sparse_linear_marker_ops"]
++    ):
++        raise RuntimeError(
++            "Ascend sparse linear marker did not record "
++            "activation_sparse_linear_packed_t."
++        )
++
++
+ def run_vllm_reference(
+     args: argparse.Namespace,
+     windows: list[list[int]],
+@@ -840,8 +1012,7 @@ def run_vllm_reference(
+     )
+     del dense_llm
+     gc.collect()
+-    if torch.cuda.is_available():
+-        torch.cuda.empty_cache()
++    empty_backend_cache()
+ 
+     sparsity_config = {
+         "enable": True,
+@@ -852,23 +1023,69 @@ def run_vllm_reference(
+         "apply_all_tokens": False,
+         "prefill_sparsify": args.vllm_prefill_sparsify,
+         "strict_unsupported_check": True,
+-        "use_sparse_gemv": False,
++        "use_sparse_gemv": args.vllm_use_sparse_gemv,
+     }
+-    sparse_llm = build_vllm(args, sparsity_config)
+-    sparse = score_vllm_windows(
+-        sparse_llm,
+-        windows,
+-        args.window_size,
+-        desc=f"vLLM sparse s={args.sparsity}",
++    previous_require_kernel = os.environ.get("VLLM_SPARSE_GEMV_REQUIRE_KERNEL")
++    previous_sparse_marker_path = os.environ.get("VLLM_SPARSE_GEMV_MARKER_PATH")
++    previous_ascend_marker_path = os.environ.get(
++        "VLLM_ASCEND_SPARSE_LINEAR_MARKER_PATH"
+     )
+-    del sparse_llm
+-    gc.collect()
+-    if torch.cuda.is_available():
+-        torch.cuda.empty_cache()
++    marker_tmpdir: tempfile.TemporaryDirectory[str] | None = None
++    marker_summary: dict[str, Any] | None = None
++    if args.vllm_use_sparse_gemv:
++        os.environ["VLLM_SPARSE_GEMV_REQUIRE_KERNEL"] = (
++            "0" if args.vllm_allow_sparse_gemv_fallback else "1"
++        )
++        marker_tmpdir = tempfile.TemporaryDirectory(prefix="vllm_ppl_sparse_gemv_")
++        sparse_marker_path = Path(marker_tmpdir.name) / "invocations.jsonl"
++        ascend_marker_path = Path(marker_tmpdir.name) / "ascend_custom_ops.jsonl"
++        os.environ["VLLM_SPARSE_GEMV_MARKER_PATH"] = str(sparse_marker_path)
++        os.environ["VLLM_ASCEND_SPARSE_LINEAR_MARKER_PATH"] = str(ascend_marker_path)
++    try:
++        sparse_llm = build_vllm(args, sparsity_config)
++        sparse = score_vllm_windows(
++            sparse_llm,
++            windows,
++            args.window_size,
++            desc=f"vLLM sparse s={args.sparsity}",
++        )
++        del sparse_llm
++        gc.collect()
++        empty_backend_cache()
++        if marker_tmpdir is not None:
++            marker_summary = summarize_sparse_kernel_markers(
++                sparse_marker_path,
++                ascend_marker_path,
++            )
++            if not args.vllm_allow_sparse_gemv_fallback:
++                validate_required_sparse_kernel_markers(marker_summary)
++    finally:
++        if previous_require_kernel is None:
++            os.environ.pop("VLLM_SPARSE_GEMV_REQUIRE_KERNEL", None)
++        else:
++            os.environ["VLLM_SPARSE_GEMV_REQUIRE_KERNEL"] = (
++                previous_require_kernel
++            )
++        if previous_sparse_marker_path is None:
++            os.environ.pop("VLLM_SPARSE_GEMV_MARKER_PATH", None)
++        else:
++            os.environ["VLLM_SPARSE_GEMV_MARKER_PATH"] = previous_sparse_marker_path
++        if previous_ascend_marker_path is None:
++            os.environ.pop("VLLM_ASCEND_SPARSE_LINEAR_MARKER_PATH", None)
++        else:
++            os.environ["VLLM_ASCEND_SPARSE_LINEAR_MARKER_PATH"] = (
++                previous_ascend_marker_path
++            )
++        if marker_tmpdir is not None:
++            marker_tmpdir.cleanup()
+     return BackendComparison(
+-        backend=f"vllm:prefill_sparsify={args.vllm_prefill_sparsify}",
++        backend=(
++            f"vllm:prefill_sparsify={args.vllm_prefill_sparsify}:"
++            f"use_sparse_gemv={args.vllm_use_sparse_gemv}"
++        ),
+         dense=dense,
+         sparse=sparse,
++        sparse_kernel_markers=marker_summary,
+     )
+ 
+ 
+diff --git a/scripts/generate_sparse_exp_fixtures.py b/scripts/generate_sparse_exp_fixtures.py
+new file mode 100644
+index 00000000000..1113fcce7c5
+--- /dev/null
++++ b/scripts/generate_sparse_exp_fixtures.py
+@@ -0,0 +1,180 @@
++from __future__ import annotations
++
++import json
++from pathlib import Path
++
++import torch
++from tokenizers import Tokenizer
++from tokenizers.models import WordLevel
++from tokenizers.pre_tokenizers import Whitespace
++from transformers import LlamaConfig, LlamaForCausalLM, PreTrainedTokenizerFast
++
++
++ROOT = Path(".cache/ascend_sparse_experiments")
++MODEL_DIR = ROOT / "tiny_llama_model"
++TEAL_ROOT = ROOT / "teal_tiny_s0.50"
++TEAL_HIST = TEAL_ROOT / "official_histograms"
++TEAL_THRESH = TEAL_ROOT / "thresholds"
++LAROSA_ROOT = ROOT / "larosa_tiny_identity"
++
++VOCAB_TOKENS = [
++    "<unk>",
++    "<s>",
++    "</s>",
++    "<pad>",
++    "TEAL",
++    "La",
++    "RoSA",
++    "applies",
++    "magnitude",
++    "based",
++    "activation",
++    "sparsity",
++    "to",
++    "transformer",
++    "hidden",
++    "states",
++    "without",
++    "retraining",
++    "Perplexity",
++    "alignment",
++    "is",
++    "checked",
++    "by",
++    "scoring",
++    "same",
++    "target",
++    "tokens",
++    "under",
++    "dense",
++    "and",
++    "sparse",
++    "execution",
++    "paths",
++    "The",
++    "vLLM",
++    "path",
++    "should",
++    "match",
++    "HF",
++    "reference",
++    "once",
++    "threshold",
++    "mapping",
++    "prefill",
++    "semantics",
++    "are",
++    "the",
++    "same",
++    ".",
++    ",",
++    "-",
++]
++
++SUPPORTED_PROJECTIONS = (
++    "self_attn.qkv",
++    "self_attn.o",
++    "mlp.gate_up",
++    "mlp.down",
++)
++
++
++def save_tiny_model() -> LlamaConfig:
++    MODEL_DIR.mkdir(parents=True, exist_ok=True)
++    unique_tokens = list(dict.fromkeys(VOCAB_TOKENS))
++    vocab = {token: idx for idx, token in enumerate(unique_tokens)}
++    tokenizer = Tokenizer(WordLevel(vocab=vocab, unk_token="<unk>"))
++    tokenizer.pre_tokenizer = Whitespace()
++    fast = PreTrainedTokenizerFast(
++        tokenizer_object=tokenizer,
++        unk_token="<unk>",
++        bos_token="<s>",
++        eos_token="</s>",
++        pad_token="<pad>",
++    )
++    fast.save_pretrained(MODEL_DIR)
++
++    torch.manual_seed(1234)
++    config = LlamaConfig(
++        vocab_size=len(vocab),
++        hidden_size=64,
++        intermediate_size=128,
++        num_hidden_layers=2,
++        num_attention_heads=4,
++        num_key_value_heads=4,
++        max_position_embeddings=128,
++        rms_norm_eps=1e-5,
++        rope_theta=10000.0,
++        bos_token_id=vocab["<s>"],
++        eos_token_id=vocab["</s>"],
++        pad_token_id=vocab["<pad>"],
++        tie_word_embeddings=False,
++    )
++    model = LlamaForCausalLM(config)
++    model.save_pretrained(MODEL_DIR, safe_serialization=True)
++    return config
++
++
++def save_teal_artifacts(config: LlamaConfig) -> None:
++    centers = torch.linspace(0.0, 1.0, 101, dtype=torch.float32)
++    counts = torch.ones(101, dtype=torch.float32)
++    threshold = torch.tensor(0.75, dtype=torch.float32)
++
++    for layer_idx in range(config.num_hidden_layers):
++        for part in ("mlp", "self_attn"):
++            path = TEAL_HIST / f"layer-{layer_idx}" / part
++            path.mkdir(parents=True, exist_ok=True)
++            torch.save(
++                {
++                    "h1_centers": centers,
++                    "h1": counts,
++                    "h2_centers": centers,
++                    "h2": counts,
++                },
++                path / "histograms.pt",
++            )
++
++        TEAL_THRESH.mkdir(parents=True, exist_ok=True)
++        for proj in SUPPORTED_PROJECTIONS:
++            torch.save(
++                threshold,
++                TEAL_THRESH / f"layers.{layer_idx}.{proj}.threshold.pt",
++            )
++
++    (TEAL_ROOT / "activation_sparsity_config.json").write_text(
++        json.dumps(
++            {
++                "enable": True,
++                "method": "teal",
++                "uniform_sparsity": 0.5,
++                "calibration_path": str(TEAL_THRESH.resolve()),
++                "decode_only": False,
++                "apply_all_tokens": False,
++                "prefill_sparsify": "half",
++                "strict_unsupported_check": True,
++                "use_sparse_gemv": False,
++            },
++            indent=2,
++        )
++        + "\n"
++    )
++
++
++def save_larosa_artifacts(config: LlamaConfig) -> None:
++    for layer_idx in range(config.num_hidden_layers):
++        path = LAROSA_ROOT / "histograms" / f"layer-{layer_idx}" / "self_attn"
++        path.mkdir(parents=True, exist_ok=True)
++        torch.save(torch.eye(config.hidden_size, dtype=torch.float32), path / "D.pt")
++
++
++def main() -> None:
++    config = save_tiny_model()
++    save_teal_artifacts(config)
++    save_larosa_artifacts(config)
++    print(f"MODEL_DIR={MODEL_DIR.resolve()}")
++    print(f"TEAL_ROOT={TEAL_ROOT.resolve()}")
++    print(f"LAROSA_ROOT={LAROSA_ROOT.resolve()}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/scripts/run_larosa_qwen25_eval.sh b/scripts/run_larosa_qwen25_eval.sh
+new file mode 100755
+index 00000000000..5870c0796fe
+--- /dev/null
++++ b/scripts/run_larosa_qwen25_eval.sh
+@@ -0,0 +1,83 @@
++#!/usr/bin/env bash
++# SPDX-License-Identifier: Apache-2.0
++set -euo pipefail
++
++MODEL="${MODEL:-Qwen/Qwen2.5-7B}"
++ARTIFACT_ROOT="${ARTIFACT_ROOT:-.cache/larosa_qwen25_7b}"
++RESULT_DIR="${RESULT_DIR:-${ARTIFACT_ROOT}/results}"
++SPARSITY="${SPARSITY:-0.4}"
++CONTEXT_SIZE="${CONTEXT_SIZE:-2048}"
++WINDOW_SIZE="${WINDOW_SIZE:-512}"
++DATASET_NAME="${DATASET_NAME:-wikitext}"
++DATASET_SUBSET="${DATASET_SUBSET:-wikitext-2-raw-v1}"
++DATASET_SPLIT="${DATASET_SPLIT:-test}"
++DATASET_SIZE="${DATASET_SIZE:-250}"
++DATASET_SAMPLE="${DATASET_SAMPLE:-random}"
++DATASET_SEED="${DATASET_SEED:-0}"
++CAPTURE_DATASET_SPLIT="${CAPTURE_DATASET_SPLIT:-train}"
++CAPTURE_DATASET_SIZE="${CAPTURE_DATASET_SIZE:-500}"
++CAPTURE_SEQUENCE_LENGTH="${CAPTURE_SEQUENCE_LENGTH:-2048}"
++CAPTURE_BATCH_SIZE="${CAPTURE_BATCH_SIZE:-1}"
++CAPTURE_MAX_SEQUENCES="${CAPTURE_MAX_SEQUENCES:-}"
++CAPTURE_MLP="${CAPTURE_MLP:-0}"
++DEVICE="${DEVICE:-npu}"
++DTYPE="${DTYPE:-bfloat16}"
++ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-eager}"
++BACKEND="${BACKEND:-both}"
++
++mkdir -p "${RESULT_DIR}"
++
++CAPTURE_ARGS=(
++  .venv/bin/python scripts/capture_larosa_activation_stats.py
++  --model "${MODEL}"
++  --output-path "${ARTIFACT_ROOT}"
++  --dataset-name "${DATASET_NAME}"
++  --dataset-subset "${DATASET_SUBSET}"
++  --dataset-split "${CAPTURE_DATASET_SPLIT}"
++  --dataset-size "${CAPTURE_DATASET_SIZE}"
++  --dataset-sample "${DATASET_SAMPLE}"
++  --dataset-seed "${DATASET_SEED}"
++  --sequence-length "${CAPTURE_SEQUENCE_LENGTH}"
++  --batch-size "${CAPTURE_BATCH_SIZE}"
++  --dtype "${DTYPE}"
++  --device "${DEVICE}"
++  --attn-implementation "${ATTN_IMPLEMENTATION}"
++)
++
++if [[ -n "${CAPTURE_MAX_SEQUENCES}" ]]; then
++  CAPTURE_ARGS+=(--max-sequences "${CAPTURE_MAX_SEQUENCES}")
++fi
++
++if [[ "${CAPTURE_MLP}" == "1" ]]; then
++  CAPTURE_ARGS+=(--capture-mlp)
++fi
++
++"${CAPTURE_ARGS[@]}"
++
++EVAL_ARGS=(
++  .venv/bin/python scripts/eval_larosa_ppl_alignment.py
++  --model "${MODEL}"
++  --calibration-path "${ARTIFACT_ROOT}"
++  --sparsity "${SPARSITY}"
++  --context-size "${CONTEXT_SIZE}"
++  --window-size "${WINDOW_SIZE}"
++  --backend "${BACKEND}"
++  --hf-reference-impl hooks
++  --hf-attn-implementation "${ATTN_IMPLEMENTATION}"
++  --dataset-name "${DATASET_NAME}"
++  --dataset-subset "${DATASET_SUBSET}"
++  --dataset-split "${DATASET_SPLIT}"
++  --dataset-size "${DATASET_SIZE}"
++  --dataset-sample "${DATASET_SAMPLE}"
++  --dataset-seed "${DATASET_SEED}"
++  --dtype "${DTYPE}"
++  --device "${DEVICE}"
++  --rotation-dtype float32
++  --json-output "${RESULT_DIR}/larosa_qwen25_s${SPARSITY}.json"
++)
++
++if [[ -n "${MAX_WINDOWS:-}" ]]; then
++  EVAL_ARGS+=(--max-windows "${MAX_WINDOWS}")
++fi
++
++"${EVAL_ARGS[@]}"
+diff --git a/scripts/run_sparse_exp_matrix.sh b/scripts/run_sparse_exp_matrix.sh
+new file mode 100755
+index 00000000000..a1ca90bed54
+--- /dev/null
++++ b/scripts/run_sparse_exp_matrix.sh
+@@ -0,0 +1,100 @@
++#!/usr/bin/env bash
++set -u
++
++cd /workspace/wanyao/seas0/vllm-hust-feat-sparse-pth
++
++export ASCEND_RT_VISIBLE_DEVICES=6
++export VLLM_TARGET_DEVICE=npu
++export VLLM_VERSION=0.17.2
++export VLLM_WORKER_MULTIPROC_METHOD=spawn
++export PYTHONPATH="/workspace/wanyao/seas0/vllm-hust-feat-sparse-pth:/workspace/wanyao/seas0/vllm-ascend-hust:${PYTHONPATH:-}"
++
++SPARSE_GEMV_ARGS=()
++if [[ "${USE_SPARSE_GEMV:-0}" == "1" ]]; then
++  SPARSE_GEMV_ARGS+=(--vllm-use-sparse-gemv)
++fi
++
++MODEL=".cache/ascend_sparse_experiments/tiny_llama_model"
++TEAL_ROOT=".cache/ascend_sparse_experiments/teal_tiny_s0.50"
++LAROSA_ROOT=".cache/ascend_sparse_experiments/larosa_tiny_identity"
++RESULT_DIR=".cache/ascend_sparse_experiments/results"
++mkdir -p "${RESULT_DIR}"
++: > "${RESULT_DIR}/status.tsv"
++
++run_case() {
++  local name="$1"
++  shift
++  local log="${RESULT_DIR}/${name}.log"
++  echo "=== ${name} ==="
++  echo -e "${name}\tSTART" >> "${RESULT_DIR}/status.tsv"
++  timeout 900 "$@" > "${log}" 2>&1
++  local status=$?
++  echo -e "${name}\t${status}" >> "${RESULT_DIR}/status.tsv"
++  tail -40 "${log}" || true
++  echo
++  return 0
++}
++
++COMMON_TEAL=(
++  .venv/bin/python scripts/eval_teal_ppl_alignment.py
++  --model "${MODEL}"
++  --artifact-root "${TEAL_ROOT}"
++  --sparsity 0.5
++  --context-size 32
++  --window-size 16
++  --max-windows 1
++  --backend both
++  --hf-reference-impl hooks
++  --hf-attn-implementation eager
++  --dtype bfloat16
++  --device npu
++  --vllm-gpu-memory-utilization 0.2
++  "${SPARSE_GEMV_ARGS[@]}"
++)
++
++run_case teal_official_half \
++  "${COMMON_TEAL[@]}" \
++  --hf-reference-mode official_half \
++  --vllm-prefill-sparsify half \
++  --json-output "${RESULT_DIR}/teal_official_half.json"
++
++run_case teal_all_tokens \
++  "${COMMON_TEAL[@]}" \
++  --hf-reference-mode all_tokens \
++  --vllm-prefill-sparsify all \
++  --json-output "${RESULT_DIR}/teal_all_tokens.json"
++
++run_case teal_decode_only \
++  "${COMMON_TEAL[@]}" \
++  --hf-reference-mode decode_only \
++  --vllm-prefill-sparsify none \
++  --json-output "${RESULT_DIR}/teal_decode_only.json"
++
++COMMON_LAROSA=(
++  .venv/bin/python scripts/eval_larosa_ppl_alignment.py
++  --model "${MODEL}"
++  --calibration-path "${LAROSA_ROOT}"
++  --context-size 32
++  --window-size 16
++  --max-windows 1
++  --backend both
++  --hf-reference-impl hooks
++  --hf-attn-implementation eager
++  --dtype bfloat16
++  --device npu
++  --vllm-gpu-memory-utilization 0.2
++  "${SPARSE_GEMV_ARGS[@]}"
++)
++
++run_case larosa_s0_40 \
++  "${COMMON_LAROSA[@]}" \
++  --sparsity 0.40 \
++  --json-output "${RESULT_DIR}/larosa_s0_40.json"
++
++run_case larosa_s0_25 \
++  "${COMMON_LAROSA[@]}" \
++  --sparsity 0.25 \
++  --json-output "${RESULT_DIR}/larosa_s0_25.json"
++
++echo "=== status.tsv ==="
++cat "${RESULT_DIR}/status.tsv"
+diff --git a/scripts/run_sparse_kernel_verification.sh b/scripts/run_sparse_kernel_verification.sh
+new file mode 100755
+index 00000000000..2eca7167291
+--- /dev/null
++++ b/scripts/run_sparse_kernel_verification.sh
+@@ -0,0 +1,586 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++VLLM_ROOT="${VLLM_ROOT:-/workspace/wanyao/seas0/vllm-hust-feat-sparse-pth}"
++ASCEND_ROOT="${ASCEND_ROOT:-/workspace/wanyao/seas0/vllm-ascend-hust}"
++PYTHON_BIN="${PYTHON_BIN:-${VLLM_ROOT}/.venv/bin/python}"
++RESULT_DIR="${RESULT_DIR:-${VLLM_ROOT}/.cache/sparse_kernel_verification}"
++ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-6}"
++
++MODEL="${MODEL:-/workspace/wanyao/seas0/models/Qwen2.5-7B}"
++TEAL_ARTIFACT_ROOT="${TEAL_ARTIFACT_ROOT:-${VLLM_ROOT}/.cache/teal_qwen25_7b_base_wikitext2_random500_seed0_s0.4}"
++LAROSA_ARTIFACT_ROOT="${LAROSA_ARTIFACT_ROOT:-${VLLM_ROOT}/.cache/larosa_qwen25_7b_base_wikitext2_random500_seed0_selfattn}"
++
++SKIP_BUILD="${SKIP_BUILD:-0}"
++RUN_THROUGHPUT="${RUN_THROUGHPUT:-1}"
++RUN_QWEN_PPL="${RUN_QWEN_PPL:-1}"
++BENCH_WARMUP="${BENCH_WARMUP:-20}"
++BENCH_ITERS="${BENCH_ITERS:-100}"
++MAX_SPARSE_ERR="${MAX_SPARSE_ERR:-0.5}"
++MAX_DIRECT_ERR="${MAX_DIRECT_ERR:-0.5}"
++MIN_PACKED_TOTAL_SPEEDUP="${MIN_PACKED_TOTAL_SPEEDUP:-1.0}"
++MIN_PACKED_TOTAL_WITH_THRESHOLD_SPEEDUP="${MIN_PACKED_TOTAL_WITH_THRESHOLD_SPEEDUP:-1.0}"
++MIN_PACKED_COMPUTE_SPEEDUP="${MIN_PACKED_COMPUTE_SPEEDUP:-1.0}"
++THROUGHPUT_NUM_PROMPTS="${THROUGHPUT_NUM_PROMPTS:-32}"
++BENCH_BATCH_SIZES="${BENCH_BATCH_SIZES:-1 ${THROUGHPUT_NUM_PROMPTS}}"
++THROUGHPUT_WARMUP_PROMPTS="${THROUGHPUT_WARMUP_PROMPTS:-4}"
++THROUGHPUT_INPUT_LEN="${THROUGHPUT_INPUT_LEN:-128}"
++THROUGHPUT_OUTPUT_LEN="${THROUGHPUT_OUTPUT_LEN:-128}"
++MIN_TOTAL_TOKEN_SPEEDUP="${MIN_TOTAL_TOKEN_SPEEDUP:-1.0}"
++MIN_OUTPUT_TOKEN_SPEEDUP="${MIN_OUTPUT_TOKEN_SPEEDUP:-1.0}"
++
++export ASCEND_RT_VISIBLE_DEVICES
++export VLLM_TARGET_DEVICE="${VLLM_TARGET_DEVICE:-npu}"
++export VLLM_VERSION="${VLLM_VERSION:-0.17.2}"
++export VLLM_WORKER_MULTIPROC_METHOD="${VLLM_WORKER_MULTIPROC_METHOD:-spawn}"
++export PYTHONPATH="${VLLM_ROOT}:${ASCEND_ROOT}:${PYTHONPATH:-}"
++
++mkdir -p "${RESULT_DIR}"
++
++SOURCE_MANIFEST="${RESULT_DIR}/source_manifest.json"
++export SOURCE_MANIFEST
++
++check_throughput_marker_metadata() {
++  local json_path="$1"
++  local method="$2"
++  "${PYTHON_BIN}" - "${json_path}" "${method}" <<'PY'
++import json
++import sys
++from pathlib import Path
++
++json_path = Path(sys.argv[1])
++method = sys.argv[2]
++result = json.loads(json_path.read_text(encoding="utf-8"))
++sparse = result["sparse"]
++
++
++def require(condition: bool, message: str) -> None:
++    if not condition:
++        raise SystemExit(f"{json_path}: {message}")
++
++
++def marker_values(prefix: str, key: str) -> list:
++    return sparse.get(f"{prefix}_marker_{key}", [])
++
++
++for prefix in ("sparse_gemv", "ascend_sparse_linear"):
++    require(
++        sparse.get(f"{prefix}_marker_records", 0) > 0,
++        f"{prefix} marker records are missing",
++    )
++    threshold_numels = marker_values(prefix, "threshold_numels")
++    x_shapes = marker_values(prefix, "x_shapes")
++    inclusives = marker_values(prefix, "inclusive")
++    require(threshold_numels, f"{prefix} threshold_numels are missing")
++    require(x_shapes, f"{prefix} x_shapes are missing")
++    require(inclusives, f"{prefix} inclusive values are missing")
++
++    if method == "teal":
++        require(
++            all(int(numel) == 1 for numel in threshold_numels),
++            f"{prefix} TEAL should use scalar threshold, got {threshold_numels}",
++        )
++        require(
++            inclusives == [False],
++            f"{prefix} TEAL should use exclusive compare, got {inclusives}",
++        )
++    elif method == "larosa":
++        rows = {
++            int(shape[0])
++            for shape in x_shapes
++            if isinstance(shape, list) and shape
++        }
++        require(rows, f"{prefix} La RoSA x_shapes do not expose batch rows")
++        require(
++            all(int(numel) in rows for numel in threshold_numels),
++            (
++                f"{prefix} La RoSA should use one threshold per row, got "
++                f"threshold_numels={threshold_numels}, x_shapes={x_shapes}"
++            ),
++        )
++        require(
++            any(int(numel) > 1 for numel in threshold_numels),
++            f"{prefix} La RoSA marker did not prove a batched row threshold",
++        )
++        require(
++            inclusives == [True],
++            f"{prefix} La RoSA should use inclusive top-k compare, got {inclusives}",
++        )
++    else:
++        raise SystemExit(f"unknown method {method!r}")
++
++ops = sparse.get("ascend_sparse_linear_marker_ops", [])
++require(
++    "activation_sparse_linear_packed_t" in ops,
++    f"Ascend packed custom op marker is missing, got {ops}",
++)
++weight_t_values = sparse.get("ascend_sparse_linear_marker_weight_t_provided", [])
++require(
++    True in weight_t_values,
++    f"Ascend marker did not prove transposed-weight path, got {weight_t_values}",
++)
++print(f"{json_path}: marker metadata validated for {method}")
++PY
++}
++
++check_ppl_marker_metadata() {
++  local json_path="$1"
++  local method="$2"
++  "${PYTHON_BIN}" - "${json_path}" "${method}" <<'PY'
++import json
++import sys
++from pathlib import Path
++
++json_path = Path(sys.argv[1])
++method = sys.argv[2]
++result = json.loads(json_path.read_text(encoding="utf-8"))
++vllm = result.get("vllm")
++if vllm is None:
++    raise SystemExit(f"{json_path}: vLLM result is missing")
++markers = vllm.get("sparse_kernel_markers")
++if markers is None:
++    raise SystemExit(f"{json_path}: sparse kernel marker summary is missing")
++
++
++def require(condition: bool, message: str) -> None:
++    if not condition:
++        raise SystemExit(f"{json_path}: {message}")
++
++
++def marker_values(prefix: str, key: str) -> list:
++    return markers.get(f"{prefix}_marker_{key}", [])
++
++
++for prefix in ("sparse_gemv", "ascend_sparse_linear"):
++    require(
++        markers.get(f"{prefix}_marker_records", 0) > 0,
++        f"{prefix} marker records are missing",
++    )
++    threshold_numels = marker_values(prefix, "threshold_numels")
++    x_shapes = marker_values(prefix, "x_shapes")
++    inclusives = marker_values(prefix, "inclusive")
++    require(threshold_numels, f"{prefix} threshold_numels are missing")
++    require(x_shapes, f"{prefix} x_shapes are missing")
++    require(inclusives, f"{prefix} inclusive values are missing")
++
++    if method == "teal":
++        require(
++            all(int(numel) == 1 for numel in threshold_numels),
++            f"{prefix} TEAL should use scalar threshold, got {threshold_numels}",
++        )
++        require(
++            inclusives == [False],
++            f"{prefix} TEAL should use exclusive compare, got {inclusives}",
++        )
++    elif method == "larosa":
++        rows = {
++            int(shape[0])
++            for shape in x_shapes
++            if isinstance(shape, list) and shape
++        }
++        require(rows, f"{prefix} La RoSA x_shapes do not expose batch rows")
++        require(
++            all(int(numel) in rows for numel in threshold_numels),
++            (
++                f"{prefix} La RoSA should use one threshold per row, got "
++                f"threshold_numels={threshold_numels}, x_shapes={x_shapes}"
++            ),
++        )
++        require(
++            any(int(numel) > 1 for numel in threshold_numels),
++            f"{prefix} La RoSA marker did not prove a batched row threshold",
++        )
++        require(
++            inclusives == [True],
++            f"{prefix} La RoSA should use inclusive top-k compare, got {inclusives}",
++        )
++    else:
++        raise SystemExit(f"unknown method {method!r}")
++
++ops = markers.get("ascend_sparse_linear_marker_ops", [])
++require(
++    "activation_sparse_linear_packed_t" in ops,
++    f"Ascend packed custom op marker is missing, got {ops}",
++)
++weight_t_values = markers.get("ascend_sparse_linear_marker_weight_t_provided", [])
++require(
++    True in weight_t_values,
++    f"Ascend marker did not prove transposed-weight path, got {weight_t_values}",
++)
++print(f"{json_path}: PPL marker metadata validated for {method}")
++PY
++}
++
++echo "=== environment ==="
++echo "VLLM_ROOT=${VLLM_ROOT}"
++echo "ASCEND_ROOT=${ASCEND_ROOT}"
++echo "PYTHON_BIN=${PYTHON_BIN}"
++echo "RESULT_DIR=${RESULT_DIR}"
++echo "ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES}"
++echo "BENCH_BATCH_SIZES=${BENCH_BATCH_SIZES}"
++"${PYTHON_BIN}" - <<'PY'
++import torch
++print("torch", torch.__version__)
++import torch_npu
++print("torch_npu", getattr(torch_npu, "__version__", "unknown"))
++print("npu_available", torch.npu.is_available())
++PY
++
++echo "=== source manifest ==="
++"${PYTHON_BIN}" - <<'PY'
++import hashlib
++import json
++import os
++import subprocess
++from pathlib import Path
++
++
++def run_git(root: Path, args: list[str]) -> str | None:
++    try:
++        return subprocess.check_output(
++            ["git", "-C", str(root), *args],
++            stderr=subprocess.DEVNULL,
++            text=True,
++        ).strip()
++    except (subprocess.CalledProcessError, FileNotFoundError):
++        return None
++
++
++def sha256_file(path: Path) -> str | None:
++    if not path.exists() or not path.is_file():
++        return None
++    digest = hashlib.sha256()
++    with path.open("rb") as source:
++        for chunk in iter(lambda: source.read(1024 * 1024), b""):
++            digest.update(chunk)
++    return digest.hexdigest()
++
++
++def repo_state(root_name: str, root: Path, files: list[str]) -> dict:
++    file_hashes = {}
++    for file_name in files:
++        path = root / file_name
++        file_hashes[file_name] = {
++            "exists": path.exists(),
++            "sha256": sha256_file(path),
++        }
++    return {
++        "name": root_name,
++        "root": str(root),
++        "branch": run_git(root, ["branch", "--show-current"]),
++        "head": run_git(root, ["rev-parse", "HEAD"]),
++        "status_porcelain": run_git(root, ["status", "--porcelain"]),
++        "tracked_remote": run_git(
++            root,
++            ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
++        ),
++        "files": file_hashes,
++    }
++
++
++vllm_root = Path(os.environ["VLLM_ROOT"]).resolve()
++ascend_root = Path(os.environ["ASCEND_ROOT"]).resolve()
++manifest = {
++    "vllm": repo_state(
++        "vllm-hust",
++        vllm_root,
++        [
++            "scripts/bench_sparse_kernel_throughput.py",
++            "scripts/eval_teal_ppl_alignment.py",
++            "scripts/eval_larosa_ppl_alignment.py",
++            "scripts/run_sparse_kernel_verification.sh",
++            "vllm/sparsity/config.py",
++            "vllm/sparsity/distribution.py",
++            "vllm/sparsity/layers.py",
++            "vllm/sparsity/kernels/sparse_gemv.py",
++            "vllm/model_executor/models/qwen2.py",
++            "vllm/model_executor/models/llama.py",
++        ],
++    ),
++    "ascend": repo_state(
++        "vllm-ascend-hust",
++        ascend_root,
++        [
++            "csrc/kernels/activation_sparse_linear.cpp",
++            "csrc/torch_binding.cpp",
++            "csrc/torch_binding_meta.cpp",
++            "csrc/ops.h",
++            "vllm_ascend/ops/sparse_linear.py",
++            "tests/ut/ops/test_sparse_linear.py",
++            "benchmarks/ops/bench_activation_sparse_linear.py",
++            "benchmarks/ops/run_activation_sparse_linear_matrix.py",
++        ],
++    ),
++}
++manifest_path = Path(os.environ["SOURCE_MANIFEST"])
++manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
++print(json.dumps(manifest, indent=2, sort_keys=True))
++PY
++
++if [[ "${SKIP_BUILD}" != "1" ]]; then
++  echo "=== build vllm-ascend-hust editable plugin ==="
++  (
++    cd "${ASCEND_ROOT}"
++    "${PYTHON_BIN}" -m pip install -v -e . --no-build-isolation --no-deps
++  )
++fi
++
++echo "=== python syntax checks ==="
++(
++  cd "${VLLM_ROOT}"
++  "${PYTHON_BIN}" -m py_compile \
++    scripts/bench_sparse_kernel_throughput.py \
++    scripts/eval_teal_ppl_alignment.py \
++    scripts/eval_larosa_ppl_alignment.py \
++    vllm/sparsity/kernels/sparse_gemv.py
++)
++(
++  cd "${ASCEND_ROOT}"
++  "${PYTHON_BIN}" -m py_compile \
++    vllm_ascend/ops/sparse_linear.py \
++    benchmarks/ops/bench_activation_sparse_linear.py \
++    benchmarks/ops/run_activation_sparse_linear_matrix.py \
++    tests/ut/ops/test_sparse_linear.py
++)
++
++echo "=== custom op unit test ==="
++if "${PYTHON_BIN}" - <<'PY'
++import importlib.util
++raise SystemExit(0 if importlib.util.find_spec("pytest") is not None else 1)
++PY
++then
++  (
++    cd "${ASCEND_ROOT}"
++    "${PYTHON_BIN}" -m pytest -q tests/ut/ops/test_sparse_linear.py
++  )
++else
++  echo "pytest is unavailable; running built-in NPU sparse-linear smoke"
++  (
++    cd "${ASCEND_ROOT}"
++    "${PYTHON_BIN}" - <<'PY'
++import torch
++
++from vllm_ascend.ops.sparse_linear import (
++    _custom_op_enabled,
++    activation_sparse_linear,
++    activation_sparse_linear_direct,
++    activation_sparse_linear_ref,
++)
++
++
++def require(condition: bool, message: str) -> None:
++    if not condition:
++        raise SystemExit(message)
++
++
++def sparse_tolerances(dtype: torch.dtype) -> tuple[float, float]:
++    if dtype == torch.bfloat16:
++        return 2e-1, 5e-2
++    return 5e-2, 5e-2
++
++
++require(hasattr(torch, "npu") and torch.npu.is_available(), "NPU is required")
++require(_custom_op_enabled(), "Ascend custom ops must be enabled")
++torch.manual_seed(0)
++for dtype in (torch.float16, torch.bfloat16):
++    x = torch.randn(3, 32, device="npu", dtype=dtype)
++    weight = torch.randn(17, 32, device="npu", dtype=dtype)
++    threshold = torch.tensor([0.25, 0.5, 0.75], device="npu")
++    actual = activation_sparse_linear(x, weight, threshold)
++    direct = activation_sparse_linear_direct(x, weight, threshold)
++    expected = activation_sparse_linear_ref(x, weight, threshold)
++    torch.npu.synchronize()
++    atol, rtol = sparse_tolerances(dtype)
++    require(
++        torch.allclose(actual.cpu(), expected.cpu(), atol=atol, rtol=rtol),
++        f"packed sparse linear mismatch for {dtype}",
++    )
++    require(
++        torch.allclose(direct.cpu(), expected.cpu(), atol=atol, rtol=rtol),
++        f"direct sparse linear mismatch for {dtype}",
++    )
++
++    batch_size = 8
++    input_dim = 128
++    output_dim = 1153
++    keep = input_dim // 2
++    x = torch.randn(batch_size, input_dim, device="npu", dtype=dtype)
++    weight = torch.randn(output_dim, input_dim, device="npu", dtype=dtype)
++    weight_t = weight.t().contiguous()
++    topk_values, _ = torch.topk(x.abs().to(dtype=torch.float32), keep, dim=-1)
++    threshold = topk_values[..., -1].contiguous()
++    values, indices, counts = torch.ops._C_ascend.activation_sparse_pack(
++        x.contiguous(),
++        threshold,
++        True,
++    )
++    packed_t = torch.ops._C_ascend.activation_sparse_linear_packed_t(
++        values,
++        indices,
++        counts,
++        weight_t,
++    )
++    wrapper = activation_sparse_linear(
++        x,
++        weight,
++        threshold,
++        inclusive=True,
++        weight_t=weight_t,
++    )
++    expected = activation_sparse_linear_ref(
++        x,
++        weight,
++        threshold,
++        inclusive=True,
++    )
++    torch.npu.synchronize()
++    require(counts.min().item() >= keep, "row_topk packed counts below keep")
++    require(counts.max().item() <= input_dim, "row_topk packed counts above input")
++    atol, rtol = sparse_tolerances(dtype)
++    require(
++        torch.allclose(packed_t.cpu(), expected.cpu(), atol=atol, rtol=rtol),
++        f"packed_t row_topk mismatch for {dtype}",
++    )
++    require(
++        torch.allclose(wrapper.cpu(), expected.cpu(), atol=atol, rtol=rtol),
++        f"wrapper row_topk mismatch for {dtype}",
++    )
++print("built-in NPU sparse-linear smoke passed")
++PY
++  )
++fi
++
++echo "=== operator benchmark matrix ==="
++read -r -a BENCH_BATCH_SIZE_ARRAY <<< "${BENCH_BATCH_SIZES}"
++BENCH_BATCH_ARGS=()
++for batch_size in "${BENCH_BATCH_SIZE_ARRAY[@]}"; do
++  BENCH_BATCH_ARGS+=(--default-batch-size "${batch_size}")
++done
++(
++  cd "${ASCEND_ROOT}"
++  "${PYTHON_BIN}" benchmarks/ops/run_activation_sparse_linear_matrix.py \
++    --dtype bfloat16 \
++    "${BENCH_BATCH_ARGS[@]}" \
++    --warmup "${BENCH_WARMUP}" \
++    --iters "${BENCH_ITERS}" \
++    --max-sparse-err "${MAX_SPARSE_ERR}" \
++    --max-direct-err "${MAX_DIRECT_ERR}" \
++    --min-packed-total-speedup "${MIN_PACKED_TOTAL_SPEEDUP}" \
++    --min-packed-total-with-threshold-speedup "${MIN_PACKED_TOTAL_WITH_THRESHOLD_SPEEDUP}" \
++    --min-packed-compute-speedup "${MIN_PACKED_COMPUTE_SPEEDUP}" \
++    --output-dir "${RESULT_DIR}/bench_activation_sparse_linear"
++)
++
++if [[ "${RUN_THROUGHPUT}" == "1" ]]; then
++  echo "=== Qwen2.5 TEAL kernel-required throughput ==="
++  (
++    cd "${VLLM_ROOT}"
++    "${PYTHON_BIN}" scripts/bench_sparse_kernel_throughput.py \
++      --model "${MODEL}" \
++      --method teal \
++      --calibration-path "${TEAL_ARTIFACT_ROOT}/thresholds" \
++      --sparsity 0.4 \
++      --num-prompts "${THROUGHPUT_NUM_PROMPTS}" \
++      --warmup-prompts "${THROUGHPUT_WARMUP_PROMPTS}" \
++      --input-len "${THROUGHPUT_INPUT_LEN}" \
++      --output-len "${THROUGHPUT_OUTPUT_LEN}" \
++      --dtype bfloat16 \
++      --gpu-memory-utilization "${VLLM_GPU_MEMORY_UTILIZATION:-0.75}" \
++      --vllm-prefill-sparsify none \
++      --min-total-token-speedup "${MIN_TOTAL_TOKEN_SPEEDUP}" \
++      --min-output-token-speedup "${MIN_OUTPUT_TOKEN_SPEEDUP}" \
++      --json-output "${RESULT_DIR}/teal_qwen25_decode_only_sparse_gemv_throughput.json"
++  )
++  check_throughput_marker_metadata \
++    "${RESULT_DIR}/teal_qwen25_decode_only_sparse_gemv_throughput.json" \
++    teal
++
++  echo "=== Qwen2.5 La RoSA kernel-required throughput ==="
++  (
++    cd "${VLLM_ROOT}"
++    "${PYTHON_BIN}" scripts/bench_sparse_kernel_throughput.py \
++      --model "${MODEL}" \
++      --method larosa \
++      --calibration-path "${LAROSA_ARTIFACT_ROOT}" \
++      --sparsity "${LAROSA_SPARSITY:-0.40}" \
++      --num-prompts "${THROUGHPUT_NUM_PROMPTS}" \
++      --warmup-prompts "${THROUGHPUT_WARMUP_PROMPTS}" \
++      --input-len "${THROUGHPUT_INPUT_LEN}" \
++      --output-len "${THROUGHPUT_OUTPUT_LEN}" \
++      --dtype bfloat16 \
++      --gpu-memory-utilization "${VLLM_GPU_MEMORY_UTILIZATION:-0.75}" \
++      --min-total-token-speedup "${MIN_TOTAL_TOKEN_SPEEDUP}" \
++      --min-output-token-speedup "${MIN_OUTPUT_TOKEN_SPEEDUP}" \
++      --json-output "${RESULT_DIR}/larosa_qwen25_sparse_gemv_throughput.json"
++  )
++  check_throughput_marker_metadata \
++    "${RESULT_DIR}/larosa_qwen25_sparse_gemv_throughput.json" \
++    larosa
++fi
++
++if [[ "${RUN_QWEN_PPL}" == "1" ]]; then
++  echo "=== Qwen2.5 TEAL kernel-required PPL ==="
++  (
++    cd "${VLLM_ROOT}"
++    "${PYTHON_BIN}" scripts/eval_teal_ppl_alignment.py \
++      --model "${MODEL}" \
++      --artifact-root "${TEAL_ARTIFACT_ROOT}" \
++      --sparsity 0.4 \
++      --dataset-name wikitext \
++      --dataset-subset wikitext-2-raw-v1 \
++      --dataset-split test \
++      --dataset-text-field text \
++      --dataset-size "${PPL_DATASET_SIZE:-100}" \
++      --dataset-sample random \
++      --dataset-seed 0 \
++      --context-size "${PPL_CONTEXT_SIZE:-2048}" \
++      --window-size "${PPL_WINDOW_SIZE:-512}" \
++      --max-windows "${PPL_MAX_WINDOWS:-32}" \
++      --backend both \
++      --hf-reference-impl hooks \
++      --hf-reference-mode decode_only \
++      --vllm-prefill-sparsify none \
++      --dtype bfloat16 \
++      --device npu \
++      --vllm-gpu-memory-utilization "${VLLM_GPU_MEMORY_UTILIZATION:-0.75}" \
++      --vllm-use-sparse-gemv \
++      --fail-on-mismatch \
++      --json-output "${RESULT_DIR}/teal_qwen25_decode_only_sparse_gemv.json"
++  )
++  check_ppl_marker_metadata \
++    "${RESULT_DIR}/teal_qwen25_decode_only_sparse_gemv.json" \
++    teal
++
++  echo "=== Qwen2.5 La RoSA kernel-required PPL ==="
++  (
++    cd "${VLLM_ROOT}"
++    "${PYTHON_BIN}" scripts/eval_larosa_ppl_alignment.py \
++      --model "${MODEL}" \
++      --calibration-path "${LAROSA_ARTIFACT_ROOT}" \
++      --sparsity "${LAROSA_SPARSITY:-0.40}" \
++      --dataset-name wikitext \
++      --dataset-subset wikitext-2-raw-v1 \
++      --dataset-split test \
++      --dataset-text-field text \
++      --dataset-size "${PPL_DATASET_SIZE:-100}" \
++      --dataset-sample random \
++      --dataset-seed 0 \
++      --context-size "${PPL_CONTEXT_SIZE:-2048}" \
++      --window-size "${PPL_WINDOW_SIZE:-512}" \
++      --max-windows "${PPL_MAX_WINDOWS:-32}" \
++      --backend both \
++      --hf-reference-impl hooks \
++      --dtype bfloat16 \
++      --device npu \
++      --vllm-gpu-memory-utilization "${VLLM_GPU_MEMORY_UTILIZATION:-0.75}" \
++      --vllm-use-sparse-gemv \
++      --fail-on-mismatch \
++      --json-output "${RESULT_DIR}/larosa_qwen25_sparse_gemv.json"
++  )
++  check_ppl_marker_metadata \
++    "${RESULT_DIR}/larosa_qwen25_sparse_gemv.json" \
++    larosa
++fi
++
++echo "=== verification artifacts ==="
++find "${RESULT_DIR}" -maxdepth 3 -type f | sort
+diff --git a/tests/sparsity/test_distribution.py b/tests/sparsity/test_distribution.py
+index c324c5bfd7b..20b88812303 100644
+--- a/tests/sparsity/test_distribution.py
++++ b/tests/sparsity/test_distribution.py
+@@ -1,16 +1,17 @@
+ # SPDX-License-Identifier: Apache-2.0
+ 
++import json
+ from types import SimpleNamespace
+ 
+ import torch
+ 
+-from vllm.forward_context import ForwardContext, override_forward_context
+ from vllm.sparsity.distribution import (
+     Distribution,
+     LaRosaSparsifyFn,
+     SparsifyFn,
+     larosa_topk,
+ )
++from vllm.sparsity.rotation import merge_rotation_into_weight
+ 
+ 
+ def test_distribution_icdf():
+@@ -111,6 +112,8 @@ def test_sparsify_fn_prefill_half_2d_fallback_masks_last_half():
+ 
+ 
+ def test_sparsify_fn_prefill_half_2d_uses_vllm_query_slices():
++    from vllm.forward_context import ForwardContext, override_forward_context
++
+     threshold = torch.tensor(1e6)
+     sparsify = SparsifyFn(threshold)
+     metadata = {
+@@ -175,10 +178,159 @@ def test_larosa_sparsify_rotates_topk_and_unrotates():
+ 
+     out = sparsify(x)
+ 
+-    expected = larosa_topk(x.double() @ rotation.double(), 0.5) @ rotation.double().t()
++    expected = larosa_topk(x.float() @ rotation.float(), 0.5) @ rotation.float().t()
+     assert torch.allclose(out, expected.to(dtype=x.dtype))
+ 
+ 
++def test_larosa_sparsify_uses_fp32_rotation_math():
++    rotation = torch.eye(4, dtype=torch.float64)
++    sparsify = LaRosaSparsifyFn(
++        sparsity_level=0.5,
++        rotation=rotation,
++        rotate_input=True,
++    )
++
++    assert sparsify.rotation.dtype == torch.float32
++
++    x = torch.tensor([[1.0, -4.0, 3.0, 2.0]], dtype=torch.bfloat16)
++    out = sparsify(x)
++
++    assert out.dtype == x.dtype
++
++
++def test_larosa_sparse_linear_rotated_input_matches_unrotation_math():
++    weight = torch.randn(6, 4)
++    q, _ = torch.linalg.qr(torch.randn(4, 4))
++    x = torch.randn(3, 4)
++    sparsify = LaRosaSparsifyFn(
++        sparsity_level=0.5,
++        rotation=q,
++        rotate_input=True,
++        use_sparse_gemv=True,
++    )
++    linear = SimpleNamespace(_larosa_sparse_weight_merged=True)
++    merged_weight = merge_rotation_into_weight(weight, q)
++
++    rotated_x = sparsify._sparse_linear_input(x, linear)
++    threshold, inclusive = sparsify._sparse_linear_threshold(rotated_x)
++    sparse_rotated_x = torch.where(
++        torch.ge(rotated_x.abs(), threshold.reshape(x.shape[0], 1)),
++        rotated_x,
++        torch.zeros_like(rotated_x),
++    )
++
++    actual = sparse_rotated_x @ merged_weight.t()
++    expected = (larosa_topk(x.float() @ q.float(), 0.5) @ q.float().t()) @ weight.t()
++
++    assert inclusive is True
++    assert torch.allclose(actual, expected, atol=1e-5)
++
++
++def test_larosa_sparse_linear_rotated_input_matches_bf16_unrotation_math():
++    torch.manual_seed(0)
++    weight = torch.randn(6, 4, dtype=torch.bfloat16)
++    q, _ = torch.linalg.qr(torch.randn(4, 4))
++    x = torch.randn(3, 4, dtype=torch.bfloat16)
++    sparsify = LaRosaSparsifyFn(
++        sparsity_level=0.5,
++        rotation=q,
++        rotate_input=True,
++        use_sparse_gemv=True,
++    )
++    linear = SimpleNamespace(_larosa_sparse_weight_merged=True)
++    merged_weight = merge_rotation_into_weight(weight, q)
++
++    rotated_x = sparsify._sparse_linear_input(x, linear)
++    threshold, inclusive = sparsify._sparse_linear_threshold(rotated_x)
++    sparse_rotated_x = torch.where(
++        torch.ge(rotated_x.abs().to(dtype=torch.float32), threshold.reshape(3, 1)),
++        rotated_x,
++        torch.zeros_like(rotated_x),
++    )
++
++    actual = sparse_rotated_x @ merged_weight.t()
++    dense_sparse_x = larosa_topk(x.float() @ q.float(), 0.5) @ q.float().t()
++    expected = dense_sparse_x.to(dtype=x.dtype) @ weight.t()
++
++    assert rotated_x.dtype == x.dtype
++    assert threshold.dtype == torch.float32
++    assert inclusive is True
++    assert torch.allclose(actual.float(), expected.float(), atol=2e-2, rtol=2e-2)
++
++
++def test_larosa_rotated_sparse_linear_requires_merged_weight():
++    sparsify = LaRosaSparsifyFn(
++        sparsity_level=0.5,
++        rotation=torch.eye(4),
++        rotate_input=True,
++        use_sparse_gemv=True,
++    )
++
++    assert sparsify._sparse_linear_input(torch.randn(1, 4), SimpleNamespace()) is None
++
++
++def test_sparse_linear_weight_t_cache_invalidates_after_weight_mutation():
++    linear = torch.nn.Linear(4, 3, bias=False)
++    sparsify = SparsifyFn(torch.tensor(0.5), use_sparse_gemv=True)
++
++    first = sparsify._get_sparse_linear_weight_t(linear, linear.weight)
++    cached = sparsify._get_sparse_linear_weight_t(linear, linear.weight)
++
++    assert cached.data_ptr() == first.data_ptr()
++    assert torch.allclose(first, linear.weight.t())
++
++    with torch.no_grad():
++        linear.weight.add_(1.0)
++
++    updated = sparsify._get_sparse_linear_weight_t(linear, linear.weight)
++
++    assert updated.data_ptr() != first.data_ptr()
++    assert torch.allclose(updated, linear.weight.t())
++    assert not torch.allclose(first, linear.weight.t())
++
++
++def test_sparse_gemv_marker_records_tensor_metadata(tmp_path, monkeypatch):
++    from vllm.sparsity.kernels.sparse_gemv import (
++        _record_sparse_gemv_invocation,
++        reset_sparse_gemv_invocation_count,
++    )
++
++    marker_path = tmp_path / "sparse_gemv_marker.jsonl"
++    monkeypatch.setenv("VLLM_SPARSE_GEMV_MARKER_PATH", str(marker_path))
++
++    reset_sparse_gemv_invocation_count()
++    _record_sparse_gemv_invocation(
++        x=torch.ones(1, 4, dtype=torch.float16),
++        threshold=torch.tensor(0.5, dtype=torch.float32),
++        inclusive=False,
++        weight_t=torch.ones(4, 3, dtype=torch.float16),
++    )
++    reset_sparse_gemv_invocation_count()
++    _record_sparse_gemv_invocation(
++        x=torch.ones(3, 4, dtype=torch.bfloat16),
++        threshold=torch.tensor([0.1, 0.2, 0.3], dtype=torch.float32),
++        inclusive=True,
++    )
++
++    records = [
++        json.loads(line)
++        for line in marker_path.read_text(encoding="utf-8").splitlines()
++    ]
++    reset_sparse_gemv_invocation_count()
++
++    assert len(records) == 2
++    assert records[0]["x_shape"] == [1, 4]
++    assert records[0]["threshold_shape"] == []
++    assert records[0]["threshold_numel"] == 1
++    assert records[0]["inclusive"] is False
++    assert records[0]["weight_t_provided"] is True
++    assert records[1]["x_shape"] == [3, 4]
++    assert records[1]["threshold_shape"] == [3]
++    assert records[1]["threshold_numel"] == 3
++    assert records[1]["inclusive"] is True
++    assert records[1]["weight_t_provided"] is False
++
++
+ def test_larosa_sparsify_second_site_topk_direct():
+     sparsify = LaRosaSparsifyFn(sparsity_level=0.5, rotate_input=False)
+     x = torch.tensor([[1.0, -4.0, 3.0, 2.0]])
+diff --git a/tests/sparsity/test_layers.py b/tests/sparsity/test_layers.py
+index 9098c3f0c0d..b1e4bf1e790 100644
+--- a/tests/sparsity/test_layers.py
++++ b/tests/sparsity/test_layers.py
+@@ -84,12 +84,38 @@ def test_build_sparsifier_larosa():
+         assert isinstance(sparsifier, LaRosaSparsifyFn)
+         assert sparsifier.rotate_input is True
+         assert sparsifier.sparsity_level == 0.4
++        assert sparsifier.apply_all_tokens is False
++        assert sparsifier.prefill_sparsify == "half"
+         x = torch.randn(4, hidden)
+-        out = sparsifier(x)
++        out = sparsifier._apply_mask(x)
+         assert out.shape == x.shape
+         assert (out == 0).any()
+ 
+ 
++def test_build_sparsifier_larosa_honors_all_token_prefill_policy():
++    with tempfile.TemporaryDirectory() as tmpdir:
++        os.makedirs(os.path.join(tmpdir, "histograms", "layer-2", "self_attn"))
++        hidden = 16
++        torch.save(
++            torch.eye(hidden),
++            os.path.join(tmpdir, "histograms", "layer-2", "self_attn", "D.pt"),
++        )
++
++        cfg = ActivationSparsityConfig(
++            enable=True,
++            method="larosa",
++            calibration_path=tmpdir,
++            uniform_sparsity=0.5,
++            apply_all_tokens=True,
++            prefill_sparsify="all",
++        )
++        sparsifier = build_sparsifier(cfg, layer_idx=2, proj_name="self_attn.qkv")
++
++        assert isinstance(sparsifier, LaRosaSparsifyFn)
++        assert sparsifier.apply_all_tokens is True
++        assert sparsifier.prefill_sparsify == "all"
++
++
+ def test_build_sparsifier_larosa_second_site_no_rotation_required():
+     with tempfile.TemporaryDirectory() as tmpdir:
+         cfg = ActivationSparsityConfig(
+@@ -104,3 +130,5 @@ def test_build_sparsifier_larosa_second_site_no_rotation_required():
+         assert isinstance(sparsifier, LaRosaSparsifyFn)
+         assert sparsifier.rotate_input is False
+         assert sparsifier.sparsity_level == 0.6
++        assert sparsifier.apply_all_tokens is False
++        assert sparsifier.prefill_sparsify == "half"
+diff --git a/tests/sparsity/test_rotation.py b/tests/sparsity/test_rotation.py
+index da222ded353..c1f98b27df6 100644
+--- a/tests/sparsity/test_rotation.py
++++ b/tests/sparsity/test_rotation.py
+@@ -5,6 +5,7 @@ import torch
+ from vllm.sparsity.rotation import (
+     RotationTransform,
+     find_rotation_matrix_path,
++    load_rotation_matrix,
+     merge_rotation_into_weight,
+     merge_rotation_into_weight_loader,
+ )
+@@ -43,6 +44,27 @@ def test_merge_rotation_into_weight():
+     assert torch.allclose(merged, weight @ rotation, atol=1e-5)
+ 
+ 
++def test_merge_rotation_into_weight_absorbs_unrotation():
++    weight = torch.randn(4, 8)
++    q, _ = torch.linalg.qr(torch.randn(8, 8))
++    rotated_x = torch.randn(3, 8)
++
++    merged = merge_rotation_into_weight(weight, q)
++
++    runtime_unrotate = (rotated_x @ q.t()) @ weight.t()
++    absorbed = rotated_x @ merged.t()
++    assert torch.allclose(absorbed, runtime_unrotate, atol=1e-5)
++
++
++def test_load_rotation_matrix_defaults_to_fp32(tmp_path):
++    rotation_path = tmp_path / "D.pt"
++    torch.save(torch.eye(4, dtype=torch.float64), rotation_path)
++
++    rotation = load_rotation_matrix(str(rotation_path))
++
++    assert rotation.dtype == torch.float32
++
++
+ def test_merge_rotation_into_weight_loader():
+     class DummyWeight:
+         def __init__(self):
+diff --git a/vllm/model_executor/models/llama.py b/vllm/model_executor/models/llama.py
+index a0e3df26484..ce032a3346e 100644
+--- a/vllm/model_executor/models/llama.py
++++ b/vllm/model_executor/models/llama.py
+@@ -56,6 +56,7 @@ from vllm.sequence import IntermediateTensors
+ from vllm.sparsity import (
+     ActivationSparsityConfig,
+     build_sparsifier,
++    merge_larosa_rotation_into_linear,
+ )
+ from vllm.v1.attention.backend import AttentionType
+ 
+@@ -127,6 +128,13 @@ class LlamaMLP(nn.Module):
+             if sparsity_config is not None
+             else None
+         )
++        if sparsity_config is not None and sparsity_config.use_sparse_gemv:
++            merge_larosa_rotation_into_linear(
++                sparsity_config,
++                layer_idx,
++                "mlp.gate_up",
++                self.gate_up_proj,
++            )
+         self.sparsify_down = (
+             build_sparsifier(sparsity_config, layer_idx, "mlp.down")
+             if sparsity_config is not None
+@@ -134,10 +142,26 @@ class LlamaMLP(nn.Module):
+         )
+ 
+     def forward(self, x):
+-        if self.sparsify_gate_up is not None:
+-            x = self.sparsify_gate_up(x)
+-        x, _ = self.gate_up_proj(x)
++        sparse_gate_up = (
++            self.sparsify_gate_up.try_apply_linear(x, self.gate_up_proj)
++            if self.sparsify_gate_up is not None
++            else None
++        )
++        if sparse_gate_up is not None:
++            x, _ = sparse_gate_up
++        else:
++            if self.sparsify_gate_up is not None:
++                x = self.sparsify_gate_up(x)
++            x, _ = self.gate_up_proj(x)
+         x = self.act_fn(x)
++        sparse_down = (
++            self.sparsify_down.try_apply_linear(x, self.down_proj)
++            if self.sparsify_down is not None
++            else None
++        )
++        if sparse_down is not None:
++            x, _ = sparse_down
++            return x
+         if self.sparsify_down is not None:
+             x = self.sparsify_down(x)
+         x, _ = self.down_proj(x)
+@@ -250,6 +274,13 @@ class LlamaAttention(nn.Module):
+             if sparsity_config is not None
+             else None
+         )
++        if sparsity_config is not None and sparsity_config.use_sparse_gemv:
++            merge_larosa_rotation_into_linear(
++                sparsity_config,
++                layer_idx,
++                "self_attn.qkv",
++                self.qkv_proj,
++            )
+         self.sparsify_o = (
+             build_sparsifier(sparsity_config, layer_idx, "self_attn.o")
+             if sparsity_config is not None
+@@ -261,12 +292,28 @@ class LlamaAttention(nn.Module):
+         positions: torch.Tensor,
+         hidden_states: torch.Tensor,
+     ) -> torch.Tensor:
+-        if self.sparsify_qkv is not None:
+-            hidden_states = self.sparsify_qkv(hidden_states)
+-        qkv, _ = self.qkv_proj(hidden_states)
++        sparse_qkv = (
++            self.sparsify_qkv.try_apply_linear(hidden_states, self.qkv_proj)
++            if self.sparsify_qkv is not None
++            else None
++        )
++        if sparse_qkv is not None:
++            qkv, _ = sparse_qkv
++        else:
++            if self.sparsify_qkv is not None:
++                hidden_states = self.sparsify_qkv(hidden_states)
++            qkv, _ = self.qkv_proj(hidden_states)
+         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+         q, k = self.rotary_emb(positions, q, k)
+         attn_output = self.attn(q, k, v)
++        sparse_o = (
++            self.sparsify_o.try_apply_linear(attn_output, self.o_proj)
++            if self.sparsify_o is not None
++            else None
++        )
++        if sparse_o is not None:
++            output, _ = sparse_o
++            return output
+         if self.sparsify_o is not None:
+             attn_output = self.sparsify_o(attn_output)
+         output, _ = self.o_proj(attn_output)
+diff --git a/vllm/model_executor/models/qwen2.py b/vllm/model_executor/models/qwen2.py
+index 5e7853ed808..8ee0e188680 100644
+--- a/vllm/model_executor/models/qwen2.py
++++ b/vllm/model_executor/models/qwen2.py
+@@ -58,6 +58,7 @@ from vllm.sequence import IntermediateTensors
+ from vllm.sparsity import (
+     ActivationSparsityConfig,
+     build_sparsifier,
++    merge_larosa_rotation_into_linear,
+ )
+ from vllm.transformers_utils.config import is_interleaved, set_default_rope_theta
+ from vllm.v1.attention.backend import AttentionType
+@@ -121,6 +122,13 @@ class Qwen2MLP(nn.Module):
+             if sparsity_config is not None
+             else None
+         )
++        if sparsity_config is not None and sparsity_config.use_sparse_gemv:
++            merge_larosa_rotation_into_linear(
++                sparsity_config,
++                layer_idx,
++                "mlp.gate_up",
++                self.gate_up_proj,
++            )
+         self.sparsify_down = (
+             build_sparsifier(sparsity_config, layer_idx, "mlp.down")
+             if sparsity_config is not None
+@@ -128,10 +136,26 @@ class Qwen2MLP(nn.Module):
+         )
+ 
+     def forward(self, x):
+-        if self.sparsify_gate_up is not None:
+-            x = self.sparsify_gate_up(x)
+-        gate_up, _ = self.gate_up_proj(x)
++        sparse_gate_up = (
++            self.sparsify_gate_up.try_apply_linear(x, self.gate_up_proj)
++            if self.sparsify_gate_up is not None
++            else None
++        )
++        if sparse_gate_up is not None:
++            gate_up, _ = sparse_gate_up
++        else:
++            if self.sparsify_gate_up is not None:
++                x = self.sparsify_gate_up(x)
++            gate_up, _ = self.gate_up_proj(x)
+         x = self.act_fn(gate_up)
++        sparse_down = (
++            self.sparsify_down.try_apply_linear(x, self.down_proj)
++            if self.sparsify_down is not None
++            else None
++        )
++        if sparse_down is not None:
++            x, _ = sparse_down
++            return x
+         if self.sparsify_down is not None:
+             x = self.sparsify_down(x)
+         x, _ = self.down_proj(x)
+@@ -234,6 +258,13 @@ class Qwen2Attention(nn.Module):
+             if sparsity_config is not None
+             else None
+         )
++        if sparsity_config is not None and sparsity_config.use_sparse_gemv:
++            merge_larosa_rotation_into_linear(
++                sparsity_config,
++                layer_idx,
++                "self_attn.qkv",
++                self.qkv_proj,
++            )
+         self.sparsify_o = (
+             build_sparsifier(sparsity_config, layer_idx, "self_attn.o")
+             if sparsity_config is not None
+@@ -245,9 +276,17 @@ class Qwen2Attention(nn.Module):
+         positions: torch.Tensor,
+         hidden_states: torch.Tensor,
+     ) -> torch.Tensor:
+-        if self.sparsify_qkv is not None:
+-            hidden_states = self.sparsify_qkv(hidden_states)
+-        qkv, _ = self.qkv_proj(hidden_states)
++        sparse_qkv = (
++            self.sparsify_qkv.try_apply_linear(hidden_states, self.qkv_proj)
++            if self.sparsify_qkv is not None
++            else None
++        )
++        if sparse_qkv is not None:
++            qkv, _ = sparse_qkv
++        else:
++            if self.sparsify_qkv is not None:
++                hidden_states = self.sparsify_qkv(hidden_states)
++            qkv, _ = self.qkv_proj(hidden_states)
+         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+ 
+         # Apply QK normalization if enabled (before RoPE)
+@@ -268,6 +307,14 @@ class Qwen2Attention(nn.Module):
+ 
+         q, k = self.rotary_emb(positions, q, k)
+         attn_output = self.attn(q, k, v)
++        sparse_o = (
++            self.sparsify_o.try_apply_linear(attn_output, self.o_proj)
++            if self.sparsify_o is not None
++            else None
++        )
++        if sparse_o is not None:
++            output, _ = sparse_o
++            return output
+         if self.sparsify_o is not None:
+             attn_output = self.sparsify_o(attn_output)
+         output, _ = self.o_proj(attn_output)
+diff --git a/vllm/sparsity/config.py b/vllm/sparsity/config.py
+index 54f3ab508e9..300ce5874e0 100644
+--- a/vllm/sparsity/config.py
++++ b/vllm/sparsity/config.py
+@@ -17,7 +17,8 @@ class ActivationSparsityConfig:
+     - ``prefill_sparsify="half"`` sparsifies only the last half of prefill
+       activations while still sparsifying single-token decode activations.
+     - ``strict_unsupported_check=True`` to fail fast on TP/quant/LoRA.
+-    - ``use_sparse_gemv=False`` because sparse GEMV is a Phase 2 experiment.
++    - ``use_sparse_gemv=False`` because sparse GEMV is an experimental
++      backend-specific path.
+     """
+ 
+     # Master switch
+@@ -64,7 +65,7 @@ class ActivationSparsityConfig:
+ 
+     # Phase 2 experimental flag
+     use_sparse_gemv: bool = False
+-    """Enable Triton sparse GEMV custom op. Phase 2 experimental feature."""
++    """Enable backend sparse GEMV custom op. Experimental feature."""
+ 
+     def __post_init__(self) -> None:
+         if self.method not in {"teal", "larosa"}:
+diff --git a/vllm/sparsity/distribution.py b/vllm/sparsity/distribution.py
+index bca116cc3a5..72f981cb38b 100644
+--- a/vllm/sparsity/distribution.py
++++ b/vllm/sparsity/distribution.py
+@@ -78,6 +78,7 @@ class SparsifyFn(nn.Module):
+         decode_only: bool = False,
+         apply_all_tokens: bool = False,
+         prefill_sparsify: str = "half",
++        use_sparse_gemv: bool = False,
+     ) -> None:
+         super().__init__()
+         if prefill_sparsify not in {"half", "all", "none"}:
+@@ -90,6 +91,7 @@ class SparsifyFn(nn.Module):
+         self.decode_only = decode_only
+         self.apply_all_tokens = apply_all_tokens
+         self.prefill_sparsify = prefill_sparsify
++        self.use_sparse_gemv = use_sparse_gemv
+ 
+     def forward(self, x: torch.Tensor) -> torch.Tensor:
+         if self.apply_all_tokens:
+@@ -119,6 +121,113 @@ class SparsifyFn(nn.Module):
+             torch.zeros_like(x),
+         )
+ 
++    def try_apply_linear(
++        self,
++        x: torch.Tensor,
++        linear_layer: nn.Module,
++    ) -> tuple[torch.Tensor, torch.Tensor | None] | None:
++        if not self.use_sparse_gemv or x.dim() != 2:
++            return None
++        if not self._sparse_linear_applies_to_all_rows(x):
++            return None
++
++        weight = getattr(linear_layer, "weight", None)
++        if weight is None or not weight.is_contiguous():
++            return None
++        if getattr(linear_layer, "quant_config", None) is not None:
++            return None
++
++        try:
++            from vllm.distributed import get_tensor_model_parallel_world_size
++
++            if get_tensor_model_parallel_world_size() != 1:
++                return None
++        except Exception:
++            return None
++
++        from vllm.sparsity.kernels.sparse_gemv import (
++            can_use_sparse_gemv,
++            sparse_gemv_impl,
++        )
++
++        if not can_use_sparse_gemv(
++            tp_size=1,
++            quant_config=getattr(linear_layer, "quant_config", None),
++            dtype=x.dtype,
++            use_sparse_gemv_flag=True,
++        ):
++            return None
++
++        sparse_input = self._sparse_linear_input(x, linear_layer)
++        if sparse_input is None:
++            return None
++
++        threshold, inclusive = self._sparse_linear_threshold(sparse_input)
++        if threshold is None:
++            return None
++
++        weight_t = self._get_sparse_linear_weight_t(linear_layer, weight)
++        output = sparse_gemv_impl(
++            sparse_input,
++            weight,
++            threshold,
++            inclusive=inclusive,
++            weight_t=weight_t,
++        )
++        bias = getattr(linear_layer, "bias", None)
++        skip_bias_add = getattr(linear_layer, "skip_bias_add", False)
++        output_bias = bias if skip_bias_add else None
++        if bias is not None and not skip_bias_add:
++            output = output + bias
++        return output, output_bias
++
++    def _get_sparse_linear_weight_t(
++        self,
++        linear_layer: nn.Module,
++        weight: torch.Tensor,
++    ) -> torch.Tensor:
++        cache_key = (
++            weight.data_ptr(),
++            tuple(weight.shape),
++            weight.dtype,
++            weight.device,
++            getattr(weight, "_version", None),
++        )
++        cached_key = getattr(linear_layer, "_activation_sparse_weight_t_key", None)
++        cached = getattr(linear_layer, "_activation_sparse_weight_t", None)
++        if cached is not None and cached_key == cache_key:
++            return cached
++        weight_t = weight.t().contiguous()
++        linear_layer._activation_sparse_weight_t = weight_t
++        linear_layer._activation_sparse_weight_t_key = cache_key
++        return weight_t
++
++    def _sparse_linear_applies_to_all_rows(self, x: torch.Tensor) -> bool:
++        if self.apply_all_tokens or self.prefill_sparsify == "all":
++            return True
++        if self.decode_only or self.prefill_sparsify == "none":
++            row_mask = self._get_vllm_decode_row_mask(x)
++        else:
++            row_mask = self._get_vllm_prefill_half_row_mask(x)
++        if row_mask is None:
++            return x.shape[0] == 1
++        return bool(row_mask.all().item())
++
++    def _sparse_linear_input(
++        self,
++        x: torch.Tensor,
++        linear_layer: nn.Module,
++    ) -> torch.Tensor | None:
++        del linear_layer
++        return x
++
++    def _sparse_linear_threshold(
++        self,
++        x: torch.Tensor,
++    ) -> tuple[torch.Tensor | None, bool]:
++        del x
++        return self.threshold.to(dtype=torch.float32), False
++
+     def _apply_rows(self, x: torch.Tensor, row_mask: torch.Tensor) -> torch.Tensor:
+         if row_mask.numel() != x.shape[0]:
+             raise ValueError(
+@@ -319,7 +428,9 @@ class LaRosaSparsifyFn(SparsifyFn):
+     For the first hidden-state sparsification site (attention qkv input and
+     MLP gate/up input), La RoSA rotates activations by ``Q``, applies per-token
+     top-k sparsity, and rotates back by ``Q.T``. For the second site (attention
+-    output and MLP intermediate), it applies top-k directly.
++    output and MLP intermediate), it applies top-k directly. When the
++    first-site linear weight has been pre-rotated as ``W <- W @ Q``, the sparse
++    linear fast path can skip the explicit ``@ Q.T`` unrotation.
+     """
+ 
+     def __init__(
+@@ -330,12 +441,14 @@ class LaRosaSparsifyFn(SparsifyFn):
+         decode_only: bool = False,
+         apply_all_tokens: bool = True,
+         prefill_sparsify: str = "all",
++        use_sparse_gemv: bool = False,
+     ) -> None:
+         super().__init__(
+             threshold=torch.tensor(0.0),
+             decode_only=decode_only,
+             apply_all_tokens=apply_all_tokens,
+             prefill_sparsify=prefill_sparsify,
++            use_sparse_gemv=use_sparse_gemv,
+         )
+         if rotate_input and rotation is None:
+             raise ValueError("La RoSA rotate_input=True requires a rotation matrix.")
+@@ -345,7 +458,7 @@ class LaRosaSparsifyFn(SparsifyFn):
+                     "La RoSA rotation matrix must be square, got "
+                     f"shape={tuple(rotation.shape)}."
+                 )
+-            rotation = rotation.to(dtype=torch.float64)
++            rotation = rotation.to(dtype=torch.float32)
+         self.sparsity_level = float(sparsity_level)
+         self.rotate_input = rotate_input
+         self.register_buffer("rotation", rotation)
+@@ -366,12 +479,47 @@ class LaRosaSparsifyFn(SparsifyFn):
+                 f"input hidden={x.shape[-1]}, rotation={tuple(self.rotation.shape)}."
+             )
+ 
+-        rotation = self.rotation.to(device=x.device)
+-        rotated_x = torch.matmul(x.to(dtype=torch.float64), rotation)
++        rotation = self.rotation.to(dtype=torch.float32, device=x.device)
++        rotated_x = torch.matmul(x.to(dtype=torch.float32), rotation)
+         sparse_rotated_x = larosa_topk(rotated_x, self.sparsity_level)
+         unrotated_x = torch.matmul(sparse_rotated_x, rotation.t())
+         return unrotated_x.to(dtype=original_dtype)
+ 
++    def _sparse_linear_input(
++        self,
++        x: torch.Tensor,
++        linear_layer: nn.Module,
++    ) -> torch.Tensor | None:
++        if not self.rotate_input:
++            return x
++        if not getattr(linear_layer, "_larosa_sparse_weight_merged", False):
++            return None
++        if self.rotation is None:
++            raise ValueError("La RoSA rotation matrix is not initialized.")
++        if x.shape[-1] != self.rotation.shape[0]:
++            raise ValueError(
++                "La RoSA rotation hidden size mismatch: "
++                f"input hidden={x.shape[-1]}, rotation={tuple(self.rotation.shape)}."
++            )
++        rotation = self.rotation.to(dtype=torch.float32, device=x.device)
++        rotated_x = torch.matmul(x.to(dtype=torch.float32), rotation)
++        return rotated_x.to(dtype=x.dtype)
++
++    def _sparse_linear_threshold(
++        self,
++        x: torch.Tensor,
++    ) -> tuple[torch.Tensor | None, bool]:
++        if self.sparsity_level <= 0.0:
++            return torch.zeros(x.shape[0], dtype=torch.float32, device=x.device), True
++        keep = int((1.0 - self.sparsity_level) * x.shape[-1])
++        if keep < 1:
++            raise ValueError(
++                "La RoSA sparsity_level keeps fewer than one activation for "
++                f"hidden size {x.shape[-1]}: sparsity_level={self.sparsity_level}."
++            )
++        topk_values, _ = torch.topk(x.abs().to(dtype=torch.float32), keep, dim=-1)
++        return topk_values[..., -1].contiguous(), True
++
+     def extra_repr(self) -> str:
+         rotation_shape = None if self.rotation is None else tuple(self.rotation.shape)
+         return (
+diff --git a/vllm/sparsity/kernels/sparse_gemv.py b/vllm/sparsity/kernels/sparse_gemv.py
+index a72bed825c2..dbde9c792f9 100644
+--- a/vllm/sparsity/kernels/sparse_gemv.py
++++ b/vllm/sparsity/kernels/sparse_gemv.py
+@@ -1,17 +1,19 @@
+ # SPDX-License-Identifier: Apache-2.0
+-"""Triton sparse GEMV kernel for TEAL (Phase 2 experimental).
++"""Backend sparse GEMV kernel for TEAL / La RoSA.
+ 
+-This module is a placeholder for the TEAL Triton sparse GEMV kernel.
+ When ``use_sparse_gemv=True`` and all constraints are satisfied:
+   - tp_size == 1
+   - quant_config is None
+   - LoRA is disabled
+   - dtype in (float16, bfloat16)
+-  - decode-only batch
++  - all rows in the input batch are eligible for sparsification
+ 
+-a custom op registered via ``direct_register_custom_op`` will be called.
++the Ascend plugin's ``activation_sparse_linear`` custom op is called when
++available. Other backends use a dense masked fallback for correctness.
+ """
+ 
++import json
++import os
+ from typing import Any, Optional
+ 
+ import torch
+@@ -20,22 +22,124 @@ from vllm.logger import init_logger
+ 
+ logger = init_logger(__name__)
+ 
++_SPARSE_GEMV_INVOCATIONS = 0
++_SPARSE_GEMV_MARKED = False
++
++
++def _requires_backend_kernel() -> bool:
++    value = os.environ.get("VLLM_SPARSE_GEMV_REQUIRE_KERNEL", "")
++    return value.lower() in {"1", "true", "yes", "on"}
++
++
++def reset_sparse_gemv_invocation_count() -> None:
++    global _SPARSE_GEMV_INVOCATIONS, _SPARSE_GEMV_MARKED
++    _SPARSE_GEMV_INVOCATIONS = 0
++    _SPARSE_GEMV_MARKED = False
++
++
++def get_sparse_gemv_invocation_count() -> int:
++    return _SPARSE_GEMV_INVOCATIONS
++
++
++def _tensor_marker_payload(name: str, tensor: torch.Tensor | None) -> dict[str, Any]:
++    if tensor is None:
++        return {f"{name}_provided": False}
++    return {
++        f"{name}_provided": True,
++        f"{name}_shape": list(tensor.shape),
++        f"{name}_dtype": str(tensor.dtype),
++        f"{name}_device": str(tensor.device),
++        f"{name}_numel": int(tensor.numel()),
++    }
++
++
++def _record_sparse_gemv_invocation(
++    *,
++    x: torch.Tensor | None = None,
++    threshold: torch.Tensor | None = None,
++    inclusive: bool | None = None,
++    weight_t: torch.Tensor | None = None,
++) -> None:
++    global _SPARSE_GEMV_INVOCATIONS, _SPARSE_GEMV_MARKED
++    _SPARSE_GEMV_INVOCATIONS += 1
++
++    marker_path = os.environ.get("VLLM_SPARSE_GEMV_MARKER_PATH")
++    if not marker_path or _SPARSE_GEMV_MARKED:
++        return
++    _SPARSE_GEMV_MARKED = True
++    try:
++        marker_dir = os.path.dirname(marker_path)
++        if marker_dir:
++            os.makedirs(marker_dir, exist_ok=True)
++        payload: dict[str, Any] = {
++            "pid": os.getpid(),
++            "invocations": _SPARSE_GEMV_INVOCATIONS,
++        }
++        payload.update(_tensor_marker_payload("x", x))
++        payload.update(_tensor_marker_payload("threshold", threshold))
++        payload.update(_tensor_marker_payload("weight_t", weight_t))
++        if inclusive is not None:
++            payload["inclusive"] = bool(inclusive)
++        with open(marker_path, "a", encoding="utf-8") as marker_file:
++            marker_file.write(json.dumps(payload, sort_keys=True) + "\n")
++    except OSError:
++        logger.warning("Failed to write sparse GEMV marker to %s", marker_path)
++
+ 
+ def sparse_gemv_impl(
+     x: torch.Tensor,
+     weight: torch.Tensor,
+     threshold: torch.Tensor,
+     sparsity_bin: int = 0,
++    inclusive: bool = False,
++    weight_t: torch.Tensor | None = None,
+ ) -> torch.Tensor:
+-    """Placeholder implementation: falls back to dense GEMV.
++    """Apply activation-threshold sparse GEMV with an AscendC fast path."""
++    del sparsity_bin
++    _record_sparse_gemv_invocation(
++        x=x,
++        threshold=threshold,
++        inclusive=inclusive,
++        weight_t=weight_t,
++    )
++    try:
++        from vllm_ascend.ops.sparse_linear import activation_sparse_linear
++    except (ImportError, ModuleNotFoundError):
++        activation_sparse_linear = None
++
++    if activation_sparse_linear is not None:
++        return activation_sparse_linear(
++            x,
++            weight,
++            threshold,
++            inclusive=inclusive,
++            weight_t=weight_t,
++        )
+ 
+-    The real Triton kernel will be added in Phase 2.
+-    """
+-    logger.warning_once(
+-        "sparse_gemv_impl is a placeholder; using dense fallback. "
+-        "Set use_sparse_gemv=False to silence this warning."
++    if _requires_backend_kernel():
++        raise RuntimeError(
++            "use_sparse_gemv=True requires vllm_ascend.ops.sparse_linear."
++            "activation_sparse_linear, but the backend op wrapper is not "
++            "importable. Unset VLLM_SPARSE_GEMV_REQUIRE_KERNEL to allow the "
++            "dense masked fallback."
++        )
++
++    logger.warning(
++        "Ascend activation_sparse_linear is unavailable; using dense masked "
++        "fallback. Set use_sparse_gemv=False to silence this warning."
++    )
++    threshold = threshold.to(dtype=torch.float32, device=x.device)
++    if threshold.numel() == 1:
++        threshold = threshold.reshape(1, 1)
++    else:
++        threshold = threshold.reshape(x.shape[0], 1)
++    compare = torch.ge if inclusive else torch.gt
++    sparse_x = torch.where(
++        compare(x.abs().to(dtype=torch.float32), threshold),
++        x,
++        torch.zeros_like(x),
+     )
+-    return torch.matmul(x, weight.t())
++    return torch.matmul(sparse_x, weight.t())
+ 
+ 
+ def can_use_sparse_gemv(
+diff --git a/vllm/sparsity/layers.py b/vllm/sparsity/layers.py
+index 2a798059244..47dc5c0418b 100644
+--- a/vllm/sparsity/layers.py
++++ b/vllm/sparsity/layers.py
+@@ -65,6 +65,7 @@ def build_sparsifier(
+         decode_only=sparsity_config.decode_only,
+         apply_all_tokens=sparsity_config.apply_all_tokens,
+         prefill_sparsify=sparsity_config.prefill_sparsify,
++        use_sparse_gemv=sparsity_config.use_sparse_gemv,
+     )
+ 
+     return sparsify_fn
+@@ -102,8 +103,9 @@ def _build_larosa_sparsifier(
+             rotation=rotation,
+             rotate_input=True,
+             decode_only=sparsity_config.decode_only,
+-            apply_all_tokens=True,
+-            prefill_sparsify="all",
++            apply_all_tokens=sparsity_config.apply_all_tokens,
++            prefill_sparsify=sparsity_config.prefill_sparsify,
++            use_sparse_gemv=sparsity_config.use_sparse_gemv,
+         )
+ 
+     if proj_name in second_site_projs:
+@@ -113,8 +115,9 @@ def _build_larosa_sparsifier(
+             rotation=None,
+             rotate_input=False,
+             decode_only=sparsity_config.decode_only,
+-            apply_all_tokens=True,
+-            prefill_sparsify="all",
++            apply_all_tokens=sparsity_config.apply_all_tokens,
++            prefill_sparsify=sparsity_config.prefill_sparsify,
++            use_sparse_gemv=sparsity_config.use_sparse_gemv,
+         )
+ 
+     logger.warning_once("Unsupported La RoSA projection %s; skipping.", proj_name)
+@@ -158,8 +161,11 @@ def merge_larosa_rotation_into_linear(
+         )
+ 
+     rotation = load_rotation_matrix(rotation_path)
+-    return merge_rotation_into_weight_loader(
++    merged = merge_rotation_into_weight_loader(
+         linear_layer,
+         rotation,
+         proj_name=f"layers.{layer_idx}.{proj_name}",
+     )
++    if merged:
++        linear_layer._larosa_sparse_weight_merged = True
++    return merged
+diff --git a/vllm/sparsity/rotation.py b/vllm/sparsity/rotation.py
+index fb502f31298..30514299205 100644
+--- a/vllm/sparsity/rotation.py
++++ b/vllm/sparsity/rotation.py
+@@ -52,8 +52,8 @@ class RotationTransform(nn.Module):
+                 "One of inv_d_path or inv_d_matrix must be provided"
+             )
+ 
+-        self.register_buffer("D", d)
+-        self.register_buffer("inv_D", inv_d)
++        self.register_buffer("D", d.to(dtype=torch.float32))
++        self.register_buffer("inv_D", inv_d.to(dtype=torch.float32))
+ 
+     def forward(self, x: torch.Tensor) -> torch.Tensor:
+         """Apply rotation: ``x @ D``."""
+@@ -101,6 +101,7 @@ def find_rotation_matrix_path(
+ def load_rotation_matrix(
+     path: str,
+     device: torch.device | str = "cpu",
++    dtype: torch.dtype = torch.float32,
+ ) -> torch.Tensor:
+     """Load a square offline La RoSA rotation matrix."""
+     rotation = torch.load(path, map_location=device, weights_only=True)
+@@ -111,7 +112,7 @@ def load_rotation_matrix(
+             "La RoSA rotation matrix must be square, got "
+             f"shape={tuple(rotation.shape)} from {path}"
+         )
+-    return rotation
++    return rotation.to(dtype=dtype)
+ 
+ 
+ def merge_rotation_into_weight(
+@@ -133,7 +134,7 @@ def merge_rotation_into_weight(
+             f"weight input size={input_size}, rotation shape={tuple(rotation.shape)}"
+         )
+ 
+-    compute_dtype = torch.float32 if weight.device.type == "cpu" else weight.dtype
++    compute_dtype = torch.float32
+     rotated_weight = torch.matmul(
+         weight.to(dtype=compute_dtype),
+         rotation.to(device=weight.device, dtype=compute_dtype),
+diff --git a/vllm/sparsity/utils.py b/vllm/sparsity/utils.py
+index 255f4d71bde..e53630a6e71 100644
+--- a/vllm/sparsity/utils.py
++++ b/vllm/sparsity/utils.py
+@@ -9,11 +9,6 @@ from typing import Any
+ import torch
+ 
+ from vllm.logger import init_logger
+-from vllm.model_executor.model_loader.weight_utils import (
+-    DisabledTqdm,
+-    get_lock,
+-    maybe_download_from_modelscope,
+-)
+ from vllm.sparsity.config import ActivationSparsityConfig
+ from vllm.sparsity.distribution import Distribution
+ 
+@@ -124,6 +119,11 @@ def get_activation_sparsity_config(
+     """
+     import huggingface_hub
+     from huggingface_hub import snapshot_download
++    from vllm.model_executor.model_loader.weight_utils import (
++        DisabledTqdm,
++        get_lock,
++        maybe_download_from_modelscope,
++    )
+ 
+     model_name_or_path = getattr(model_config, "model", None)
+     if model_name_or_path is None:
+-- 
+2.53.0.windows.3
+

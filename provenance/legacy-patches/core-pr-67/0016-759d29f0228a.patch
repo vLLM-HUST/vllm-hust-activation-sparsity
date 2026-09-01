@@ -1,0 +1,1815 @@
+From 759d29f0228ab570413ef8f0bc51f4a06eb0c5ae Mon Sep 17 00:00:00 2001
+From: Seas0 <season1277@outlook.com>
+Date: Tue, 30 Jun 2026 06:40:12 +0800
+Subject: [PATCH] Add activation sparse single-batch path
+
+---
+ scripts/bench_sparse_kernel_throughput.py | 163 ++++++--
+ scripts/eval_teal_ppl_alignment.py        | 125 ++++++-
+ tests/sparsity/test_distribution.py       | 170 +++++++++
+ vllm/model_executor/models/qwen2.py       |  24 +-
+ vllm/sparsity/config.py                   |  15 +
+ vllm/sparsity/distribution.py             | 345 ++++++++++++++++-
+ vllm/sparsity/kernels/sparse_gemv.py      | 428 +++++++++++++++++++++-
+ vllm/sparsity/layers.py                   |  27 +-
+ 8 files changed, 1236 insertions(+), 61 deletions(-)
+
+diff --git a/scripts/bench_sparse_kernel_throughput.py b/scripts/bench_sparse_kernel_throughput.py
+index 22eb10fc6d1..7fa149aa430 100644
+--- a/scripts/bench_sparse_kernel_throughput.py
++++ b/scripts/bench_sparse_kernel_throughput.py
+@@ -19,6 +19,12 @@ from typing import Any
+ import torch
+ 
+ 
++SPARSE_MARKER_ENV_NAMES = (
++    "VLLM_SPARSE_GEMV_MARKER_PATH",
++    "VLLM_ASCEND_SPARSE_LINEAR_MARKER_PATH",
++)
++
++
+ def parse_args() -> argparse.Namespace:
+     parser = argparse.ArgumentParser()
+     parser.add_argument("--model", required=True)
+@@ -30,6 +36,25 @@ def parse_args() -> argparse.Namespace:
+     parser.add_argument("--input-len", type=int, default=128)
+     parser.add_argument("--output-len", type=int, default=128)
+     parser.add_argument("--seed", type=int, default=0)
++    parser.add_argument(
++        "--text-file",
++        type=Path,
++        default=None,
++        help=(
++            "Optional plain-text prompt source. When set, prompts are "
++            "deterministic token windows from this text instead of random "
++            "token ids."
++        ),
++    )
++    parser.add_argument(
++        "--inline-text",
++        action="append",
++        default=None,
++        help=(
++            "Inline prompt source. Can be passed multiple times. Ignored when "
++            "--text-file is set."
++        ),
++    )
+     parser.add_argument(
+         "--dtype",
+         choices=["float16", "bfloat16"],
+@@ -38,6 +63,16 @@ def parse_args() -> argparse.Namespace:
+     parser.add_argument("--trust-remote-code", action="store_true")
+     parser.add_argument("--gpu-memory-utilization", type=float, default=0.75)
+     parser.add_argument("--max-model-len", type=int, default=None)
++    parser.add_argument(
++        "--max-num-batched-tokens",
++        type=int,
++        default=None,
++        help=(
++            "Optional vLLM scheduler max_num_batched_tokens override. This is "
++            "useful for single-batch kernel checks where the default scheduler "
++            "token buffer is much larger than the measured request."
++        ),
++    )
+     parser.add_argument("--enforce-eager", action="store_true")
+     parser.add_argument("--shutdown-timeout", type=int, default=60)
+     parser.add_argument("--vllm-prefill-sparsify", default="none")
+@@ -51,6 +86,16 @@ def parse_args() -> argparse.Namespace:
+             "Useful for Ascend-friendly gate/up-only throughput checks."
+         ),
+     )
++    parser.add_argument(
++        "--target-layer",
++        action="append",
++        type=int,
++        default=None,
++        help=(
++            "Restrict activation sparsity to this zero-based layer id. "
++            "Can be repeated."
++        ),
++    )
+     parser.add_argument(
+         "--sparse-gemv-dense-fallback-policy",
+         choices=["mask", "identity"],
+@@ -97,22 +142,50 @@ def empty_backend_cache() -> None:
+         torch.cuda.empty_cache()
+ 
+ 
+-def build_prompts(
+-    model: str,
+-    num_prompts: int,
+-    input_len: int,
+-    seed: int,
+-    trust_remote_code: bool,
+-) -> list[dict[str, list[int]]]:
++def build_text_prompt_ids(args: argparse.Namespace, tokenizer: Any) -> list[int] | None:
++    if args.text_file is None and not args.inline_text:
++        return None
++    if args.text_file is not None:
++        text = args.text_file.read_text(encoding="utf-8")
++    else:
++        text = "\n\n".join(args.inline_text)
++    token_ids = tokenizer(text, add_special_tokens=False).input_ids
++    token_ids = [int(token_id) for token_id in token_ids]
++    if not token_ids:
++        raise ValueError("Text prompt source produced no tokens.")
++    return token_ids
++
++
++def build_prompts(args: argparse.Namespace) -> list[dict[str, list[int]]]:
+     from transformers import AutoTokenizer
+ 
+     tokenizer = AutoTokenizer.from_pretrained(
+-        model,
+-        trust_remote_code=trust_remote_code,
++        args.model,
++        trust_remote_code=args.trust_remote_code,
+     )
++    text_prompt_ids = build_text_prompt_ids(args, tokenizer)
++    if text_prompt_ids is not None:
++        if len(text_prompt_ids) < args.input_len:
++            repeats = (
++                args.input_len + len(text_prompt_ids) - 1
++            ) // len(text_prompt_ids)
++            text_prompt_ids = (text_prompt_ids * repeats)[: args.input_len]
++        prompts = []
++        for prompt_idx in range(args.num_prompts):
++            start = (prompt_idx * args.input_len) % len(text_prompt_ids)
++            prompt_token_ids = text_prompt_ids[start : start + args.input_len]
++            if len(prompt_token_ids) < args.input_len:
++                prompt_token_ids += text_prompt_ids[
++                    : args.input_len - len(prompt_token_ids)
++                ]
++            prompts.append({"prompt_token_ids": prompt_token_ids})
++        return prompts
++
+     vocab_size = int(getattr(tokenizer, "vocab_size", 0))
+     if vocab_size <= 0:
+-        raise ValueError(f"Tokenizer for {model!r} has invalid vocab_size={vocab_size}")
++        raise ValueError(
++            f"Tokenizer for {args.model!r} has invalid vocab_size={vocab_size}"
++        )
+ 
+     excluded_ids = {
+         token_id
+@@ -121,12 +194,12 @@ def build_prompts(
+     }
+     candidate_ids = [i for i in range(vocab_size) if i not in excluded_ids]
+     if not candidate_ids:
+-        raise ValueError(f"Tokenizer for {model!r} has no non-special token ids")
++        raise ValueError(f"Tokenizer for {args.model!r} has no non-special token ids")
+ 
+-    rng = random.Random(seed)
++    rng = random.Random(args.seed)
+     prompts: list[dict[str, list[int]]] = []
+-    for _ in range(num_prompts):
+-        prompt_token_ids = [rng.choice(candidate_ids) for _ in range(input_len)]
++    for _ in range(args.num_prompts):
++        prompt_token_ids = [rng.choice(candidate_ids) for _ in range(args.input_len)]
+         prompts.append({"prompt_token_ids": prompt_token_ids})
+     return prompts
+ 
+@@ -157,6 +230,8 @@ def build_sparse_config(args: argparse.Namespace) -> dict[str, Any]:
+         )
+     if args.target_projection:
+         common["target_projections"] = args.target_projection
++    if args.target_layer:
++        common["target_layers"] = args.target_layer
+     return common
+ 
+ 
+@@ -178,6 +253,8 @@ def build_llm(
+     }
+     if activation_sparsity_config is not None:
+         kwargs["activation_sparsity_config"] = activation_sparsity_config
++    if args.max_num_batched_tokens is not None:
++        kwargs["max_num_batched_tokens"] = args.max_num_batched_tokens
+     return LLM(**kwargs)
+ 
+ 
+@@ -186,6 +263,7 @@ def run_case(
+     prompts: list[dict[str, list[int]]],
+     activation_sparsity_config: dict[str, Any] | None,
+     label: str,
++    disable_sparse_markers_during_timing: bool = False,
+ ) -> dict[str, Any]:
+     from vllm import SamplingParams
+ 
+@@ -202,11 +280,37 @@ def run_case(
+         llm.generate(warmup_prompts, sampling_params, use_tqdm=False)
+         synchronize()
+ 
++    disabled_marker_env: dict[str, str | None] | None = None
++    if disable_sparse_markers_during_timing:
++        marker_paths = [
++            Path(os.environ[name])
++            for name in SPARSE_MARKER_ENV_NAMES
++            if os.environ.get(name)
++        ]
++        markers_ready = len(marker_paths) == len(SPARSE_MARKER_ENV_NAMES) and all(
++            marker_path.exists() and marker_path.stat().st_size > 0
++            for marker_path in marker_paths
++        )
++        if markers_ready:
++            disabled_marker_env = {
++                name: os.environ.get(name) for name in SPARSE_MARKER_ENV_NAMES
++            }
++            for name in SPARSE_MARKER_ENV_NAMES:
++                os.environ.pop(name, None)
++
+     synchronize()
+-    start = time.perf_counter()
+-    outputs = llm.generate(prompts, sampling_params, use_tqdm=True)
+-    synchronize()
+-    elapsed = time.perf_counter() - start
++    try:
++        start = time.perf_counter()
++        outputs = llm.generate(prompts, sampling_params, use_tqdm=True)
++        synchronize()
++        elapsed = time.perf_counter() - start
++    finally:
++        if disabled_marker_env is not None:
++            for name, value in disabled_marker_env.items():
++                if value is None:
++                    os.environ.pop(name, None)
++                else:
++                    os.environ[name] = value
+ 
+     prompt_tokens = sum(len(output.prompt_token_ids or []) for output in outputs)
+     output_tokens = sum(
+@@ -233,6 +337,7 @@ def run_case(
+         "requests_per_second": len(prompts) / elapsed,
+         "total_tokens_per_second": total_tokens / elapsed,
+         "output_tokens_per_second": output_tokens / elapsed,
++        "sparse_markers_disabled_during_timing": disabled_marker_env is not None,
+     }
+ 
+ 
+@@ -299,13 +404,7 @@ def main() -> int:
+     if args.method == "larosa" and args.sparsity * 1.2 >= 1.0:
+         raise ValueError("La RoSA h2 sparsity is sparsity * 1.2 and must be < 1")
+ 
+-    prompts = build_prompts(
+-        args.model,
+-        args.num_prompts,
+-        args.input_len,
+-        args.seed,
+-        args.trust_remote_code,
+-    )
++    prompts = build_prompts(args)
+     dense = run_case(args, prompts, None, "dense")
+ 
+     previous_require_kernel = os.environ.get("VLLM_SPARSE_GEMV_REQUIRE_KERNEL")
+@@ -335,7 +434,13 @@ def main() -> int:
+     os.environ["VLLM_ASCEND_SPARSE_LINEAR_MARKER_PATH"] = str(ascend_marker_path)
+     reset_sparse_invocation_counter()
+     try:
+-        sparse = run_case(args, prompts, build_sparse_config(args), "sparse")
++        sparse = run_case(
++            args,
++            prompts,
++            build_sparse_config(args),
++            "sparse",
++            disable_sparse_markers_during_timing=True,
++        )
+     finally:
+         if previous_require_kernel is None:
+             os.environ.pop("VLLM_SPARSE_GEMV_REQUIRE_KERNEL", None)
+@@ -498,6 +603,7 @@ def main() -> int:
+         not args.no_require_sparse_invocations
+         and sparse_invocations_current_process == 0
+         and not sparse_marker_records
++        and not ascend_marker_records
+     ):
+         failures.append("sparse run did not invoke vLLM sparse GEMV shim")
+     if not args.allow_sparse_gemv_fallback and not ascend_marker_records:
+@@ -523,8 +629,13 @@ def main() -> int:
+         "input_len": args.input_len,
+         "output_len": args.output_len,
+         "num_prompts": args.num_prompts,
++        "max_num_batched_tokens": args.max_num_batched_tokens,
++        "prompt_source": (
++            "text" if args.text_file is not None or args.inline_text else "random"
++        ),
+         "dtype": args.dtype,
+         "sparse_linear_policy": os.environ.get("VLLM_SPARSE_GEMV_LINEAR_POLICY"),
++        "target_layers": args.target_layer,
+         "sparse_gemv_dense_fallback_policy": (
+             args.sparse_gemv_dense_fallback_policy
+         ),
+diff --git a/scripts/eval_teal_ppl_alignment.py b/scripts/eval_teal_ppl_alignment.py
+index ca6793120c1..566badc7cc2 100644
+--- a/scripts/eval_teal_ppl_alignment.py
++++ b/scripts/eval_teal_ppl_alignment.py
+@@ -198,6 +198,17 @@ def parse_args() -> argparse.Namespace:
+             "sparsifies every token, none sparsifies decode tokens only."
+         ),
+     )
++    backends.add_argument(
++        "--vllm-score-mode",
++        choices=["prompt_logprobs", "decode_next_token"],
++        default="prompt_logprobs",
++        help=(
++            "vLLM PPL scoring path. prompt_logprobs scores target tokens "
++            "during prefill. decode_next_token scores each target as a "
++            "one-token decode step using logprob_token_ids, matching "
++            "prefill_sparsify=none generation checks."
++        ),
++    )
+     backends.add_argument(
+         "--target-projection",
+         action="append",
+@@ -208,6 +219,16 @@ def parse_args() -> argparse.Namespace:
+             "projection. Can be repeated."
+         ),
+     )
++    backends.add_argument(
++        "--target-layer",
++        action="append",
++        type=int,
++        default=None,
++        help=(
++            "Restrict vLLM activation sparsity to this zero-based layer id. "
++            "Can be repeated."
++        ),
++    )
+     backends.add_argument(
+         "--vllm-use-sparse-gemv",
+         action=argparse.BooleanOptionalAction,
+@@ -900,6 +921,91 @@ def score_vllm_windows(
+     )
+ 
+ 
++def score_vllm_decode_next_token_windows(
++    llm: Any,
++    windows: list[list[int]],
++    window_size: int,
++    desc: str,
++) -> PPLStats:
++    """Score targets as generated decode steps.
++
++    ``prompt_logprobs`` measures prompt prefill logits. For decode-only sparse
++    generation, the relevant quality check is the next-token decode logits after
++    a dense prefix. ``logprob_token_ids`` lets each request ask for the target
++    token's logprob without full-vocabulary logprobs.
++    """
++    from vllm import SamplingParams
++
++    nlls: list[float] = []
++    weighted_nll_sum = 0.0
++    token_count = 0
++    for window in tqdm(windows, desc=desc):
++        start = target_start(len(window), window_size)
++        prompts: list[dict[str, list[int]]] = []
++        targets: list[int] = []
++        for position in range(start, len(window)):
++            if position <= 0:
++                continue
++            prompts.append({"prompt_token_ids": window[:position]})
++            targets.append(int(window[position]))
++        if not prompts:
++            continue
++
++        target_ids = sorted(set(targets))
++        sampling_params = SamplingParams(
++            temperature=0.0,
++            max_tokens=1,
++            ignore_eos=True,
++            logprob_token_ids=target_ids,
++            detokenize=False,
++        )
++        outputs = llm.generate(
++            prompts,
++            sampling_params,
++            use_tqdm=False,
++        )
++        if len(outputs) != len(targets):
++            raise RuntimeError(
++                f"vLLM returned {len(outputs)} outputs for "
++                f"{len(targets)} decode scoring prompts."
++            )
++
++        nll = 0.0
++        count = 0
++        for output, target in zip(outputs, targets):
++            if not output.outputs:
++                raise RuntimeError("vLLM returned no decode output.")
++            logprobs = output.outputs[0].logprobs
++            if not logprobs:
++                raise RuntimeError("vLLM did not return decode logprobs.")
++            entry = logprobs[0]
++            item = entry.get(target)
++            if item is None:
++                raise KeyError(
++                    f"Target token id {target} missing from decode logprobs."
++                )
++            nll -= float(item.logprob)
++            count += 1
++
++        window_nll = nll / count
++        nlls.append(window_nll)
++        weighted_nll_sum += nll
++        token_count += count
++
++    if not nlls or token_count == 0:
++        raise ValueError("No decode PPL targets were scored.")
++    mean_nll = sum(nlls) / len(nlls)
++    token_weighted_nll = weighted_nll_sum / token_count
++    return PPLStats(
++        nll=mean_nll,
++        ppl=math.exp(mean_nll),
++        token_weighted_nll=token_weighted_nll,
++        token_weighted_ppl=math.exp(token_weighted_nll),
++        windows=len(nlls),
++        tokens=token_count,
++    )
++
++
+ def build_vllm(
+     args: argparse.Namespace,
+     activation_sparsity_config: dict[str, Any] | None,
+@@ -1075,7 +1181,10 @@ def validate_required_sparse_kernel_markers(
+     accepted_ops = {
+         "activation_sparse_linear",
+         "activation_sparse_linear_direct_t",
++        "activation_sparse_silu_and_mul_direct_t",
++        "activation_sparse_silu_and_mul_packed_t",
+         "activation_sparse_linear_packed_t",
++        "activation_sparse_topk_matmul_silu",
+     }
+     if not any(
+         op in accepted_ops
+@@ -1092,8 +1201,13 @@ def run_vllm_reference(
+     windows: list[list[int]],
+     calibration_path: Path,
+ ) -> BackendComparison:
++    score_fn = (
++        score_vllm_decode_next_token_windows
++        if args.vllm_score_mode == "decode_next_token"
++        else score_vllm_windows
++    )
+     dense_llm = build_vllm(args, None)
+-    dense = score_vllm_windows(
++    dense = score_fn(
+         dense_llm,
+         windows,
+         args.window_size,
+@@ -1116,6 +1230,8 @@ def run_vllm_reference(
+     }
+     if args.target_projection:
+         sparsity_config["target_projections"] = args.target_projection
++    if args.target_layer:
++        sparsity_config["target_layers"] = args.target_layer
+     previous_require_kernel = os.environ.get("VLLM_SPARSE_GEMV_REQUIRE_KERNEL")
+     previous_sparse_marker_path = os.environ.get("VLLM_SPARSE_GEMV_MARKER_PATH")
+     previous_ascend_marker_path = os.environ.get(
+@@ -1150,7 +1266,7 @@ def run_vllm_reference(
+         os.environ["VLLM_ASCEND_SPARSE_LINEAR_MARKER_PATH"] = str(ascend_marker_path)
+     try:
+         sparse_llm = build_vllm(args, sparsity_config)
+-        sparse = score_vllm_windows(
++        sparse = score_fn(
+             sparse_llm,
+             windows,
+             args.window_size,
+@@ -1197,7 +1313,8 @@ def run_vllm_reference(
+             marker_tmpdir.cleanup()
+     return BackendComparison(
+         backend=(
+-            f"vllm:prefill_sparsify={args.vllm_prefill_sparsify}:"
++            f"vllm:score_mode={args.vllm_score_mode}:"
++            f"prefill_sparsify={args.vllm_prefill_sparsify}:"
+             f"use_sparse_gemv={args.vllm_use_sparse_gemv}:"
+             "sparse_gemv_dense_fallback="
+             f"{args.vllm_sparse_gemv_dense_fallback_policy}:"
+@@ -1339,6 +1456,8 @@ def main() -> int:
+                 "hf_reference_impl": args.hf_reference_impl,
+                 "hf_reference_mode": args.hf_reference_mode,
+                 "vllm_prefill_sparsify": args.vllm_prefill_sparsify,
++                "vllm_score_mode": args.vllm_score_mode,
++                "vllm_target_layers": args.target_layer,
+                 "vllm_sparse_gemv_dense_fallback_policy": (
+                     args.vllm_sparse_gemv_dense_fallback_policy
+                 ),
+diff --git a/tests/sparsity/test_distribution.py b/tests/sparsity/test_distribution.py
+index f8d0f2449b9..b1f97a2f91b 100644
+--- a/tests/sparsity/test_distribution.py
++++ b/tests/sparsity/test_distribution.py
+@@ -4,13 +4,17 @@ import json
+ from types import SimpleNamespace
+ 
+ import torch
++import pytest
+ 
++import vllm.sparsity.distribution as distribution_module
++from vllm.sparsity.config import ActivationSparsityConfig
+ from vllm.sparsity.distribution import (
+     Distribution,
+     LaRosaSparsifyFn,
+     SparsifyFn,
+     larosa_topk,
+ )
++from vllm.sparsity.layers import build_sparsifier, targets_layer
+ from vllm.sparsity.rotation import merge_rotation_into_weight
+ 
+ 
+@@ -83,6 +87,44 @@ def test_sparsify_fn_moved_threshold():
+     assert sparsify.threshold.device.type == "cpu"
+ 
+ 
++def test_activation_sparsity_config_validates_target_layers():
++    cfg = ActivationSparsityConfig(enable=True, target_layers=[0, 3])
++    assert targets_layer(cfg, 0)
++    assert not targets_layer(cfg, 1)
++    assert targets_layer(cfg, 3)
++
++    with pytest.raises(ValueError, match="target_layers"):
++        ActivationSparsityConfig(enable=True, target_layers=[-1])
++
++
++def test_build_sparsifier_skips_non_target_layer_without_calibration():
++    cfg = ActivationSparsityConfig(
++        enable=True,
++        calibration_path=None,
++        target_layers=[1],
++        target_projections=["mlp.gate_up"],
++    )
++
++    assert build_sparsifier(cfg, 0, "mlp.gate_up") is None
++
++
++def test_sparsify_fn_threshold_cache_reuses_and_invalidates():
++    sparsify = SparsifyFn(torch.tensor(0.5, dtype=torch.float32))
++    x = torch.randn(1, 4)
++
++    first = sparsify._threshold_for(x, dtype=torch.float16)
++    second = sparsify._threshold_for(x, dtype=torch.float16)
++
++    assert first is second
++    assert first.dtype == torch.float16
++
++    sparsify.threshold.fill_(0.75)
++    updated = sparsify._threshold_for(x, dtype=torch.float16)
++
++    assert updated is not first
++    assert updated.item() == torch.tensor(0.75, dtype=torch.float16).item()
++
++
+ def test_sparsify_fn_prefill_half_3d_matches_official_behavior():
+     threshold = torch.tensor(1e6)
+     sparsify = SparsifyFn(threshold)
+@@ -272,6 +314,56 @@ def test_larosa_rotated_sparse_linear_requires_merged_weight():
+     assert sparsify._sparse_linear_input(torch.randn(1, 4), SimpleNamespace()) is None
+ 
+ 
++def test_larosa_try_apply_gate_up_silu_uses_rotated_sparse_input(monkeypatch):
++    monkeypatch.setenv("VLLM_SPARSE_GEMV_LINEAR_POLICY", "all")
++    rotation = torch.tensor(
++        [
++            [0.0, 1.0, 0.0, 0.0],
++            [1.0, 0.0, 0.0, 0.0],
++            [0.0, 0.0, 1.0, 0.0],
++            [0.0, 0.0, 0.0, 1.0],
++        ],
++        dtype=torch.float32,
++    )
++    sparsify = LaRosaSparsifyFn(
++        sparsity_level=0.5,
++        rotation=rotation,
++        rotate_input=True,
++        use_sparse_gemv=True,
++    )
++    sparsify._tensor_model_parallel_world_size_is_one = lambda: True
++    linear = SimpleNamespace(
++        weight=torch.randn(6, 4, dtype=torch.float16).contiguous(),
++        quant_config=None,
++        _larosa_sparse_weight_merged=True,
++    )
++    x = torch.tensor([[1.0, -4.0, 3.0, 2.0]], dtype=torch.float16)
++    captured = {}
++
++    def fake_fused_gate_up(x_arg, weight, weight_t, threshold, *, inclusive):
++        captured["x"] = x_arg
++        captured["weight_t"] = weight_t
++        captured["threshold"] = threshold
++        captured["inclusive"] = inclusive
++        return torch.empty(x_arg.shape[0], weight.shape[0] // 2, dtype=x_arg.dtype)
++
++    monkeypatch.setattr(
++        distribution_module,
++        "sparse_gemv_silu_and_mul_direct_t_cached_impl",
++        fake_fused_gate_up,
++    )
++
++    out = sparsify.try_apply_gate_up_silu(x, linear)
++
++    rotated_x = x.float() @ rotation
++    expected_threshold = torch.topk(rotated_x.abs(), 2, dim=-1).values[..., -1]
++    assert out is not None
++    assert torch.allclose(captured["x"].float(), rotated_x)
++    assert torch.allclose(captured["threshold"], expected_threshold)
++    assert captured["weight_t"].shape == (4, 6)
++    assert captured["inclusive"] is True
++
++
+ def test_larosa_try_apply_linear_rejects_shape_before_rotation(monkeypatch):
+     monkeypatch.delenv("VLLM_SPARSE_GEMV_LINEAR_POLICY", raising=False)
+     monkeypatch.delenv("VLLM_SPARSE_GEMV_MIN_SPARSITY", raising=False)
+@@ -311,6 +403,44 @@ def test_sparse_linear_weight_t_cache_invalidates_after_weight_mutation():
+     assert not torch.allclose(first, linear.weight.t())
+ 
+ 
++def test_sparse_linear_plan_reuses_cached_threshold_and_weight_t(monkeypatch):
++    monkeypatch.setenv("VLLM_SPARSE_GEMV_LINEAR_POLICY", "all")
++    linear = torch.nn.Linear(4, 3, bias=False).to(dtype=torch.float16)
++    sparsify = SparsifyFn(
++        torch.tensor(0.5),
++        apply_all_tokens=True,
++        use_sparse_gemv=True,
++    )
++    sparsify._tensor_model_parallel_world_size_is_one = lambda: True
++    calls = []
++
++    def fake_sparse_gemv_impl(x, weight, threshold, **kwargs):
++        calls.append((threshold, kwargs["weight_t"]))
++        return x @ weight.t()
++
++    monkeypatch.setattr(
++        distribution_module,
++        "sparse_gemv_impl",
++        fake_sparse_gemv_impl,
++    )
++    x = torch.randn(1, 4, dtype=torch.float16)
++
++    first, _ = sparsify.try_apply_linear(x, linear)
++    plan = sparsify._sparse_linear_plan
++    second, _ = sparsify.try_apply_linear(x, linear)
++
++    assert torch.allclose(first, second)
++    assert len(calls) == 2
++    assert calls[1][0] is calls[0][0]
++    assert calls[1][1] is calls[0][1]
++    assert sparsify._get_cached_sparse_linear_plan(x, linear, linear.weight) is plan
++
++    with torch.no_grad():
++        linear.weight.add_(1.0)
++
++    assert sparsify._get_cached_sparse_linear_plan(x, linear, linear.weight) is None
++
++
+ def test_sparse_linear_auto_policy_keeps_single_batch_wide_output(monkeypatch):
+     monkeypatch.delenv("VLLM_SPARSE_GEMV_LINEAR_POLICY", raising=False)
+     monkeypatch.delenv("VLLM_SPARSE_GEMV_MIN_SPARSITY", raising=False)
+@@ -525,6 +655,46 @@ def test_sparse_gemv_marker_records_tensor_metadata(tmp_path, monkeypatch):
+     assert records[1]["active_sparsity_mean"] == 0.5
+ 
+ 
++def test_ascend_direct_t_fast_path_marker_records_metadata(tmp_path, monkeypatch):
++    from vllm.sparsity.kernels.sparse_gemv import (
++        _record_ascend_sparse_linear_marker,
++        reset_sparse_gemv_invocation_count,
++    )
++
++    marker_path = tmp_path / "ascend_sparse_linear_marker.jsonl"
++    monkeypatch.setenv("VLLM_ASCEND_SPARSE_LINEAR_MARKER_PATH", str(marker_path))
++    reset_sparse_gemv_invocation_count()
++
++    _record_ascend_sparse_linear_marker(
++        x=torch.ones(1, 4, dtype=torch.float16),
++        threshold=torch.tensor(0.5, dtype=torch.float32),
++        inclusive=False,
++        weight_t=torch.ones(4, 3, dtype=torch.float16),
++    )
++    _record_ascend_sparse_linear_marker(
++        x=torch.ones(2, 4, dtype=torch.float16),
++        threshold=torch.tensor([0.5, 0.5], dtype=torch.float32),
++        inclusive=True,
++        weight_t=torch.ones(4, 3, dtype=torch.float16),
++    )
++
++    records = [
++        json.loads(line)
++        for line in marker_path.read_text(encoding="utf-8").splitlines()
++    ]
++    reset_sparse_gemv_invocation_count()
++
++    assert len(records) == 1
++    assert records[0]["op"] == "activation_sparse_linear_direct_t"
++    assert records[0]["pid"] > 0
++    assert records[0]["x_shape"] == [1, 4]
++    assert records[0]["threshold_shape"] == []
++    assert records[0]["threshold_numel"] == 1
++    assert records[0]["inclusive"] is False
++    assert records[0]["weight_t_provided"] is True
++    assert records[0]["weight_t_shape"] == [4, 3]
++
++
+ def test_larosa_sparsify_second_site_topk_direct():
+     sparsify = LaRosaSparsifyFn(sparsity_level=0.5, rotate_input=False)
+     x = torch.tensor([[1.0, -4.0, 3.0, 2.0]])
+diff --git a/vllm/model_executor/models/qwen2.py b/vllm/model_executor/models/qwen2.py
+index 7ee849ae2fc..9f39b6e9ec7 100644
+--- a/vllm/model_executor/models/qwen2.py
++++ b/vllm/model_executor/models/qwen2.py
+@@ -136,18 +136,26 @@ class Qwen2MLP(nn.Module):
+         )
+ 
+     def forward(self, x):
+-        sparse_gate_up = (
+-            self.sparsify_gate_up.try_apply_linear(x, self.gate_up_proj)
++        sparse_gate_up_silu = (
++            self.sparsify_gate_up.try_apply_gate_up_silu(x, self.gate_up_proj)
+             if self.sparsify_gate_up is not None
+             else None
+         )
+-        if sparse_gate_up is not None:
+-            gate_up, _ = sparse_gate_up
++        if sparse_gate_up_silu is not None:
++            x = sparse_gate_up_silu
+         else:
+-            if self.sparsify_gate_up is not None:
+-                x = self.sparsify_gate_up.apply_dense_fallback(x)
+-            gate_up, _ = self.gate_up_proj(x)
+-        x = self.act_fn(gate_up)
++            sparse_gate_up = (
++                self.sparsify_gate_up.try_apply_linear(x, self.gate_up_proj)
++                if self.sparsify_gate_up is not None
++                else None
++            )
++            if sparse_gate_up is not None:
++                gate_up, _ = sparse_gate_up
++            else:
++                if self.sparsify_gate_up is not None:
++                    x = self.sparsify_gate_up.apply_dense_fallback(x)
++                gate_up, _ = self.gate_up_proj(x)
++            x = self.act_fn(gate_up)
+         sparse_down = (
+             self.sparsify_down.try_apply_linear(x, self.down_proj)
+             if self.sparsify_down is not None
+diff --git a/vllm/sparsity/config.py b/vllm/sparsity/config.py
+index efb7e1d5f43..8db8eb750ed 100644
+--- a/vllm/sparsity/config.py
++++ b/vllm/sparsity/config.py
+@@ -79,6 +79,10 @@ class ActivationSparsityConfig:
+     """If set, only apply activation sparsity to these projection names, e.g.
+     ``["mlp.gate_up"]`` for the Ascend-friendly fused-MLP path."""
+ 
++    # Optional layer filter
++    target_layers: list[int] | None = None
++    """If set, only apply activation sparsity to these zero-based layer ids."""
++
+     def __post_init__(self) -> None:
+         if self.method not in {"teal", "larosa"}:
+             raise ValueError(
+@@ -100,6 +104,17 @@ class ActivationSparsityConfig:
+                     f"{unknown}. Supported projections are "
+                     f"{sorted(_SUPPORTED_TARGET_PROJECTIONS)}."
+                 )
++        if self.target_layers is not None:
++            unknown_layers = [
++                layer_idx
++                for layer_idx in self.target_layers
++                if not isinstance(layer_idx, int) or layer_idx < 0
++            ]
++            if unknown_layers:
++                raise ValueError(
++                    "target_layers must contain non-negative integer layer ids, "
++                    f"got {unknown_layers}."
++                )
+ 
+     def compute_hash(self) -> str:
+         """Return a hash that uniquely identifies this sparsity config.
+diff --git a/vllm/sparsity/distribution.py b/vllm/sparsity/distribution.py
+index f5a3145c8db..20b6c85a210 100644
+--- a/vllm/sparsity/distribution.py
++++ b/vllm/sparsity/distribution.py
+@@ -6,10 +6,29 @@ import os
+ import torch
+ from torch import nn
+ 
++from vllm.sparsity.kernels.sparse_gemv import (
++    can_use_sparse_gemv,
++    sparse_gemv_direct_t_cached_impl,
++    sparse_gemv_impl,
++    sparse_gemv_silu_and_mul_direct_t_cached_impl,
++    sparse_gemv_topk_matmul_silu_impl,
++    should_use_topk_matmul_silu,
++)
++
+ 
+ _DEFAULT_SPARSE_GEMV_MIN_SPARSITY = 0.70
+ 
+ 
++def _is_torch_compiling() -> bool:
++    is_compiling = getattr(getattr(torch, "compiler", None), "is_compiling", None)
++    if is_compiling is None:
++        return False
++    try:
++        return bool(is_compiling())
++    except Exception:
++        return False
++
++
+ class Distribution:
+     """Histogram-based distribution for threshold calibration.
+ 
+@@ -100,6 +119,50 @@ class SparsifyFn(nn.Module):
+         self.use_sparse_gemv = use_sparse_gemv
+         self.expected_sparsity = expected_sparsity
+ 
++    def _cached_tensor_to(
++        self,
++        cache_name: str,
++        tensor: torch.Tensor,
++        *,
++        dtype: torch.dtype,
++        device: torch.device,
++    ) -> torch.Tensor:
++        if _is_torch_compiling():
++            if tensor.dtype == dtype and tensor.device == device:
++                return tensor
++            return tensor.to(dtype=dtype, device=device)
++
++        cache_key = (
++            tensor.data_ptr(),
++            tuple(tensor.shape),
++            tensor.dtype,
++            dtype,
++            device.type,
++            device.index,
++            getattr(tensor, "_version", None),
++        )
++        cached_key = getattr(self, f"_{cache_name}_cache_key", None)
++        cached = getattr(self, f"_{cache_name}_cache", None)
++        if cached is not None and cached_key == cache_key:
++            return cached
++        moved = tensor.to(dtype=dtype, device=device)
++        setattr(self, f"_{cache_name}_cache_key", cache_key)
++        setattr(self, f"_{cache_name}_cache", moved)
++        return moved
++
++    def _threshold_for(
++        self,
++        x: torch.Tensor,
++        *,
++        dtype: torch.dtype,
++    ) -> torch.Tensor:
++        return self._cached_tensor_to(
++            "threshold",
++            self.threshold,
++            dtype=dtype,
++            device=x.device,
++        )
++
+     def forward(self, x: torch.Tensor) -> torch.Tensor:
+         if self.apply_all_tokens:
+             return self._apply_mask(x)
+@@ -123,7 +186,7 @@ class SparsifyFn(nn.Module):
+ 
+     def _apply_mask(self, x: torch.Tensor) -> torch.Tensor:
+         return torch.where(
+-            x.abs() > self.threshold.to(dtype=x.dtype, device=x.device),
++            x.abs() > self._threshold_for(x, dtype=x.dtype),
+             x,
+             torch.zeros_like(x),
+         )
+@@ -158,24 +221,18 @@ class SparsifyFn(nn.Module):
+         weight = getattr(linear_layer, "weight", None)
+         if weight is None or not weight.is_contiguous():
+             return None
++        cached_plan = self._get_cached_sparse_linear_plan(x, linear_layer, weight)
++        if cached_plan is not None:
++            return self._apply_sparse_linear_plan(x, cached_plan)
++
+         if getattr(linear_layer, "quant_config", None) is not None:
+             return None
+         if not self._should_use_sparse_linear_kernel(x, weight):
+             return None
+ 
+-        try:
+-            from vllm.distributed import get_tensor_model_parallel_world_size
+-
+-            if get_tensor_model_parallel_world_size() != 1:
+-                return None
+-        except Exception:
++        if not self._tensor_model_parallel_world_size_is_one():
+             return None
+ 
+-        from vllm.sparsity.kernels.sparse_gemv import (
+-            can_use_sparse_gemv,
+-            sparse_gemv_impl,
+-        )
+-
+         if not can_use_sparse_gemv(
+             tp_size=1,
+             quant_config=getattr(linear_layer, "quant_config", None),
+@@ -193,6 +250,14 @@ class SparsifyFn(nn.Module):
+             return None
+ 
+         weight_t = self._get_sparse_linear_weight_t(linear_layer, weight)
++        self._set_cached_sparse_linear_plan(
++            x=x,
++            linear_layer=linear_layer,
++            weight=weight,
++            weight_t=weight_t,
++            threshold=threshold,
++            inclusive=inclusive,
++        )
+         output = sparse_gemv_impl(
+             sparse_input,
+             weight,
+@@ -207,11 +272,226 @@ class SparsifyFn(nn.Module):
+             output = output + bias
+         return output, output_bias
+ 
++    def try_apply_gate_up_silu(
++        self,
++        x: torch.Tensor,
++        linear_layer: nn.Module,
++    ) -> torch.Tensor | None:
++        if not self.use_sparse_gemv or x.dim() != 2:
++            return None
++        if not self._sparse_linear_applies_to_all_rows(x):
++            return None
++
++        weight = getattr(linear_layer, "weight", None)
++        if weight is None or not weight.is_contiguous():
++            return None
++        if weight.dim() != 2 or weight.shape[0] % 2 != 0:
++            return None
++
++        cached_plan = self._get_cached_sparse_linear_plan(x, linear_layer, weight)
++        if cached_plan is not None:
++            return self._apply_sparse_gate_up_silu_plan(x, cached_plan)
++
++        if getattr(linear_layer, "quant_config", None) is not None:
++            return None
++        if not self._should_use_sparse_linear_kernel(x, weight):
++            return None
++
++        if not self._tensor_model_parallel_world_size_is_one():
++            return None
++
++        if not can_use_sparse_gemv(
++            tp_size=1,
++            quant_config=getattr(linear_layer, "quant_config", None),
++            dtype=x.dtype,
++            use_sparse_gemv_flag=True,
++        ):
++            return None
++
++        sparse_input = self._sparse_linear_input(x, linear_layer)
++        if sparse_input is None:
++            return None
++
++        topk_output = self._try_apply_topk_matmul_gate_up_silu(
++            sparse_input,
++            linear_layer,
++            weight,
++        )
++        if topk_output is not None:
++            return topk_output
++
++        threshold, inclusive = self._sparse_linear_threshold(sparse_input)
++        if threshold is None:
++            return None
++
++        weight_t = self._get_sparse_linear_weight_t(linear_layer, weight)
++        output = sparse_gemv_silu_and_mul_direct_t_cached_impl(
++            sparse_input,
++            weight,
++            weight_t,
++            threshold,
++            inclusive=inclusive,
++        )
++        if output is None:
++            return None
++
++        self._set_cached_sparse_linear_plan(
++            x=x,
++            linear_layer=linear_layer,
++            weight=weight,
++            weight_t=weight_t,
++            threshold=threshold,
++            inclusive=inclusive,
++        )
++        return output
++
++    def _get_cached_sparse_linear_plan(
++        self,
++        x: torch.Tensor,
++        linear_layer: nn.Module,
++        weight: torch.Tensor,
++    ) -> dict | None:
++        if _is_torch_compiling():
++            return None
++
++        plan = getattr(self, "_sparse_linear_plan", None)
++        if plan is None:
++            return None
++        if plan.get("cache_key") != self._sparse_linear_plan_cache_key(
++            x,
++            linear_layer,
++            weight,
++        ):
++            return None
++        return plan
++
++    def _try_apply_topk_matmul_gate_up_silu(
++        self,
++        sparse_input: torch.Tensor,
++        linear_layer: nn.Module,
++        weight: torch.Tensor,
++    ) -> torch.Tensor | None:
++        del sparse_input, linear_layer, weight
++        return None
++
++    def _set_cached_sparse_linear_plan(
++        self,
++        *,
++        x: torch.Tensor,
++        linear_layer: nn.Module,
++        weight: torch.Tensor,
++        weight_t: torch.Tensor,
++        threshold: torch.Tensor,
++        inclusive: bool,
++    ) -> None:
++        if _is_torch_compiling():
++            return
++
++        # La RoSA can derive a per-row threshold from each input. Only cache
++        # the static-threshold TEAL-style plan in the base sparsifier.
++        if type(self) is not SparsifyFn:
++            return
++        if threshold.numel() not in {1, x.shape[0]}:
++            return
++        self._sparse_linear_plan = {
++            "cache_key": self._sparse_linear_plan_cache_key(
++                x,
++                linear_layer,
++                weight,
++            ),
++            "weight": weight,
++            "weight_t": weight_t,
++            "threshold": threshold,
++            "inclusive": inclusive,
++            "bias": getattr(linear_layer, "bias", None),
++            "skip_bias_add": getattr(linear_layer, "skip_bias_add", False),
++        }
++
++    def _sparse_linear_plan_cache_key(
++        self,
++        x: torch.Tensor,
++        linear_layer: nn.Module,
++        weight: torch.Tensor,
++    ) -> tuple:
++        return (
++            id(linear_layer),
++            tuple(x.shape),
++            x.dtype,
++            x.device.type,
++            x.device.index,
++            weight.data_ptr(),
++            tuple(weight.shape),
++            weight.dtype,
++            weight.device.type,
++            weight.device.index,
++            getattr(weight, "_version", None),
++            self.threshold.data_ptr(),
++            tuple(self.threshold.shape),
++            self.threshold.dtype,
++            getattr(self.threshold, "_version", None),
++        )
++
++    def _apply_sparse_linear_plan(
++        self,
++        x: torch.Tensor,
++        plan: dict,
++    ) -> tuple[torch.Tensor, torch.Tensor | None]:
++        output = sparse_gemv_direct_t_cached_impl(
++            x,
++            plan["weight"],
++            plan["weight_t"],
++            plan["threshold"],
++            inclusive=plan["inclusive"],
++        )
++        if output is None:
++            output = sparse_gemv_impl(
++                x,
++                plan["weight"],
++                plan["threshold"],
++                inclusive=plan["inclusive"],
++                weight_t=plan["weight_t"],
++            )
++        bias = plan["bias"]
++        skip_bias_add = plan["skip_bias_add"]
++        output_bias = bias if skip_bias_add else None
++        if bias is not None and not skip_bias_add:
++            output = output + bias
++        return output, output_bias
++
++    def _apply_sparse_gate_up_silu_plan(
++        self,
++        x: torch.Tensor,
++        plan: dict,
++    ) -> torch.Tensor | None:
++        return sparse_gemv_silu_and_mul_direct_t_cached_impl(
++            x,
++            plan["weight"],
++            plan["weight_t"],
++            plan["threshold"],
++            inclusive=plan["inclusive"],
++        )
++
++    def _tensor_model_parallel_world_size_is_one(self) -> bool:
++        cached = getattr(self, "_sparse_linear_tp_world_size_is_one", None)
++        if cached is not None:
++            return cached
++        try:
++            from vllm.distributed import get_tensor_model_parallel_world_size
++
++            is_one = get_tensor_model_parallel_world_size() == 1
++        except Exception:
++            is_one = False
++        self._sparse_linear_tp_world_size_is_one = is_one
++        return is_one
++
+     def _get_sparse_linear_weight_t(
+         self,
+         linear_layer: nn.Module,
+         weight: torch.Tensor,
+     ) -> torch.Tensor:
++        if _is_torch_compiling():
++            return weight.t().contiguous()
++
+         cache_key = (
+             weight.data_ptr(),
+             tuple(weight.shape),
+@@ -301,8 +581,7 @@ class SparsifyFn(nn.Module):
+         self,
+         x: torch.Tensor,
+     ) -> tuple[torch.Tensor | None, bool]:
+-        del x
+-        return self.threshold.to(dtype=torch.float32), False
++        return self._threshold_for(x, dtype=torch.float32), False
+ 
+     def _apply_rows(self, x: torch.Tensor, row_mask: torch.Tensor) -> torch.Tensor:
+         if row_mask.numel() != x.shape[0]:
+@@ -568,6 +847,16 @@ class LaRosaSparsifyFn(SparsifyFn):
+         self.rotate_input = rotate_input
+         self.register_buffer("rotation", rotation)
+ 
++    def _rotation_for(self, x: torch.Tensor) -> torch.Tensor:
++        if self.rotation is None:
++            raise ValueError("La RoSA rotation matrix is not initialized.")
++        return self._cached_tensor_to(
++            "rotation",
++            self.rotation,
++            dtype=torch.float32,
++            device=x.device,
++        )
++
+     def _apply_mask(self, x: torch.Tensor) -> torch.Tensor:
+         if self.sparsity_level <= 0.0:
+             return x
+@@ -584,7 +873,7 @@ class LaRosaSparsifyFn(SparsifyFn):
+                 f"input hidden={x.shape[-1]}, rotation={tuple(self.rotation.shape)}."
+             )
+ 
+-        rotation = self.rotation.to(dtype=torch.float32, device=x.device)
++        rotation = self._rotation_for(x)
+         rotated_x = torch.matmul(x.to(dtype=torch.float32), rotation)
+         sparse_rotated_x = larosa_topk(rotated_x, self.sparsity_level)
+         unrotated_x = torch.matmul(sparse_rotated_x, rotation.t())
+@@ -606,7 +895,7 @@ class LaRosaSparsifyFn(SparsifyFn):
+                 "La RoSA rotation hidden size mismatch: "
+                 f"input hidden={x.shape[-1]}, rotation={tuple(self.rotation.shape)}."
+             )
+-        rotation = self.rotation.to(dtype=torch.float32, device=x.device)
++        rotation = self._rotation_for(x)
+         rotated_x = torch.matmul(x.to(dtype=torch.float32), rotation)
+         return rotated_x.to(dtype=x.dtype)
+ 
+@@ -625,6 +914,30 @@ class LaRosaSparsifyFn(SparsifyFn):
+         topk_values, _ = torch.topk(x.abs().to(dtype=torch.float32), keep, dim=-1)
+         return topk_values[..., -1].contiguous(), True
+ 
++    def _try_apply_topk_matmul_gate_up_silu(
++        self,
++        sparse_input: torch.Tensor,
++        linear_layer: nn.Module,
++        weight: torch.Tensor,
++    ) -> torch.Tensor | None:
++        if not should_use_topk_matmul_silu():
++            return None
++        if not self.rotate_input:
++            return None
++        if not getattr(linear_layer, "_larosa_sparse_weight_merged", False):
++            return None
++        if self.sparsity_level <= 0.0:
++            return None
++        keep = int((1.0 - self.sparsity_level) * sparse_input.shape[-1])
++        if keep < 1:
++            return None
++        weight_t = self._get_sparse_linear_weight_t(linear_layer, weight)
++        return sparse_gemv_topk_matmul_silu_impl(
++            sparse_input,
++            weight_t,
++            keep,
++        )
++
+     def extra_repr(self) -> str:
+         rotation_shape = None if self.rotation is None else tuple(self.rotation.shape)
+         return (
+diff --git a/vllm/sparsity/kernels/sparse_gemv.py b/vllm/sparsity/kernels/sparse_gemv.py
+index eab0c83415a..681d88ec342 100644
+--- a/vllm/sparsity/kernels/sparse_gemv.py
++++ b/vllm/sparsity/kernels/sparse_gemv.py
+@@ -24,6 +24,17 @@ logger = init_logger(__name__)
+ 
+ _SPARSE_GEMV_INVOCATIONS = 0
+ _SPARSE_GEMV_MARKED = False
++_SPARSE_GEMV_MARKER_RECORDS = 0
++_ASCEND_SPARSE_LINEAR_MARKED = False
++_ASCEND_SPARSE_LINEAR_MARKER_RECORDS = 0
++_ASCEND_SPARSE_LINEAR_IMPORT_ATTEMPTED = False
++_ASCEND_SPARSE_LINEAR = None
++_ASCEND_DIRECT_T_OP = None
++_ASCEND_SILU_AND_MUL_DIRECT_T_OP = None
++_ASCEND_PACK_OP = None
++_ASCEND_SILU_AND_MUL_PACKED_T_OP = None
++_ASCEND_CUSTOM_OP_IMPORT_ATTEMPTED = False
++_ASCEND_CUSTOM_OP_ENABLED = False
+ 
+ 
+ def _requires_backend_kernel() -> bool:
+@@ -33,14 +44,107 @@ def _requires_backend_kernel() -> bool:
+ 
+ def reset_sparse_gemv_invocation_count() -> None:
+     global _SPARSE_GEMV_INVOCATIONS, _SPARSE_GEMV_MARKED
++    global _SPARSE_GEMV_MARKER_RECORDS
++    global _ASCEND_SPARSE_LINEAR_MARKED, _ASCEND_SPARSE_LINEAR_MARKER_RECORDS
+     _SPARSE_GEMV_INVOCATIONS = 0
+     _SPARSE_GEMV_MARKED = False
++    _SPARSE_GEMV_MARKER_RECORDS = 0
++    _ASCEND_SPARSE_LINEAR_MARKED = False
++    _ASCEND_SPARSE_LINEAR_MARKER_RECORDS = 0
+ 
+ 
+ def get_sparse_gemv_invocation_count() -> int:
+     return _SPARSE_GEMV_INVOCATIONS
+ 
+ 
++def _get_ascend_sparse_linear():
++    global _ASCEND_SPARSE_LINEAR_IMPORT_ATTEMPTED, _ASCEND_SPARSE_LINEAR
++    if not _ASCEND_SPARSE_LINEAR_IMPORT_ATTEMPTED:
++        _ASCEND_SPARSE_LINEAR_IMPORT_ATTEMPTED = True
++        try:
++            from vllm_ascend.ops.sparse_linear import activation_sparse_linear
++        except (ImportError, ModuleNotFoundError):
++            _ASCEND_SPARSE_LINEAR = None
++        else:
++            _ASCEND_SPARSE_LINEAR = activation_sparse_linear
++    return _ASCEND_SPARSE_LINEAR
++
++
++def _ensure_ascend_custom_ops_registered() -> bool:
++    global _ASCEND_CUSTOM_OP_IMPORT_ATTEMPTED, _ASCEND_CUSTOM_OP_ENABLED
++    if not _ASCEND_CUSTOM_OP_IMPORT_ATTEMPTED:
++        _ASCEND_CUSTOM_OP_IMPORT_ATTEMPTED = True
++        try:
++            from vllm_ascend.utils import enable_custom_op
++        except (ImportError, ModuleNotFoundError):
++            _ASCEND_CUSTOM_OP_ENABLED = False
++        else:
++            _ASCEND_CUSTOM_OP_ENABLED = bool(enable_custom_op())
++    return _ASCEND_CUSTOM_OP_ENABLED
++
++
++def _get_ascend_direct_t_op():
++    global _ASCEND_DIRECT_T_OP
++    if _ASCEND_DIRECT_T_OP is None:
++        if not _ensure_ascend_custom_ops_registered():
++            return None
++        try:
++            _ASCEND_DIRECT_T_OP = torch.ops._C_ascend.activation_sparse_linear_direct_t
++        except (AttributeError, RuntimeError):
++            return None
++    return _ASCEND_DIRECT_T_OP
++
++
++def _get_ascend_silu_and_mul_direct_t_op():
++    global _ASCEND_SILU_AND_MUL_DIRECT_T_OP
++    if _ASCEND_SILU_AND_MUL_DIRECT_T_OP is None:
++        if not _ensure_ascend_custom_ops_registered():
++            return None
++        try:
++            _ASCEND_SILU_AND_MUL_DIRECT_T_OP = (
++                torch.ops._C_ascend.activation_sparse_silu_and_mul_direct_t
++            )
++        except (AttributeError, RuntimeError):
++            return None
++    return _ASCEND_SILU_AND_MUL_DIRECT_T_OP
++
++
++def _get_ascend_pack_op():
++    global _ASCEND_PACK_OP
++    if _ASCEND_PACK_OP is None:
++        if not _ensure_ascend_custom_ops_registered():
++            return None
++        try:
++            _ASCEND_PACK_OP = torch.ops._C_ascend.activation_sparse_pack
++        except (AttributeError, RuntimeError):
++            return None
++    return _ASCEND_PACK_OP
++
++
++def _get_ascend_silu_and_mul_packed_t_op():
++    global _ASCEND_SILU_AND_MUL_PACKED_T_OP
++    if _ASCEND_SILU_AND_MUL_PACKED_T_OP is None:
++        if not _ensure_ascend_custom_ops_registered():
++            return None
++        try:
++            _ASCEND_SILU_AND_MUL_PACKED_T_OP = (
++                torch.ops._C_ascend.activation_sparse_silu_and_mul_packed_t
++            )
++        except (AttributeError, RuntimeError):
++            return None
++    return _ASCEND_SILU_AND_MUL_PACKED_T_OP
++
++
++def _should_use_packed_silu_and_mul_t() -> bool:
++    mode = os.environ.get("VLLM_ASCEND_SPARSE_LINEAR_IMPL", "auto").lower()
++    return mode in {"packed", "packed_t", "silu_packed", "silu_packed_t"}
++
++
++def should_use_topk_matmul_silu() -> bool:
++    mode = os.environ.get("VLLM_ASCEND_SPARSE_LINEAR_IMPL", "auto").lower()
++    return mode in {"topk_matmul", "topk-matmul", "larosa_topk_matmul"}
++
++
+ def _tensor_marker_payload(name: str, tensor: torch.Tensor | None) -> dict[str, Any]:
+     if tensor is None:
+         return {f"{name}_provided": False}
+@@ -98,6 +202,45 @@ def _activity_marker_payload(
+     }
+ 
+ 
++def _marker_record_limit() -> int:
++    value = os.environ.get("VLLM_SPARSE_GEMV_MARKER_LIMIT")
++    if value is None:
++        return 1
++    try:
++        return max(0, int(value))
++    except ValueError:
++        return 1
++
++
++def _is_torch_compiling() -> bool:
++    is_compiling = getattr(getattr(torch, "compiler", None), "is_compiling", None)
++    if is_compiling is None:
++        return False
++    try:
++        return bool(is_compiling())
++    except Exception:
++        return False
++
++
++def _is_npu_tensor(tensor: torch.Tensor) -> bool:
++    if getattr(tensor, "is_npu", False):
++        return True
++    if not _is_torch_compiling():
++        return False
++    return getattr(getattr(tensor, "device", None), "type", None) == "npu"
++
++
++def _threshold_numel_is_supported(
++    threshold: torch.Tensor,
++    x: torch.Tensor,
++) -> bool:
++    if threshold.numel() == 1:
++        return True
++    if _is_torch_compiling():
++        return True
++    return threshold.numel() == x.shape[0]
++
++
+ def _record_sparse_gemv_invocation(
+     *,
+     x: torch.Tensor | None = None,
+@@ -106,12 +249,19 @@ def _record_sparse_gemv_invocation(
+     weight_t: torch.Tensor | None = None,
+ ) -> None:
+     global _SPARSE_GEMV_INVOCATIONS, _SPARSE_GEMV_MARKED
++    global _SPARSE_GEMV_MARKER_RECORDS
+     _SPARSE_GEMV_INVOCATIONS += 1
+ 
++    if _is_torch_compiling():
++        return
++
++    marker_limit = _marker_record_limit()
++    if _SPARSE_GEMV_MARKER_RECORDS >= marker_limit:
++        _SPARSE_GEMV_MARKED = marker_limit > 0
++        return
+     marker_path = os.environ.get("VLLM_SPARSE_GEMV_MARKER_PATH")
+-    if not marker_path or _SPARSE_GEMV_MARKED:
++    if not marker_path:
+         return
+-    _SPARSE_GEMV_MARKED = True
+     try:
+         marker_dir = os.path.dirname(marker_path)
+         if marker_dir:
+@@ -119,6 +269,7 @@ def _record_sparse_gemv_invocation(
+         payload: dict[str, Any] = {
+             "pid": os.getpid(),
+             "invocations": _SPARSE_GEMV_INVOCATIONS,
++            "marker_record": _SPARSE_GEMV_MARKER_RECORDS + 1,
+         }
+         payload.update(_tensor_marker_payload("x", x))
+         payload.update(_tensor_marker_payload("threshold", threshold))
+@@ -131,10 +282,161 @@ def _record_sparse_gemv_invocation(
+             payload["inclusive"] = bool(inclusive)
+         with open(marker_path, "a", encoding="utf-8") as marker_file:
+             marker_file.write(json.dumps(payload, sort_keys=True) + "\n")
++        _SPARSE_GEMV_MARKER_RECORDS += 1
++        _SPARSE_GEMV_MARKED = _SPARSE_GEMV_MARKER_RECORDS >= marker_limit
+     except OSError:
+         logger.warning("Failed to write sparse GEMV marker to %s", marker_path)
+ 
+ 
++def _record_ascend_sparse_linear_marker(
++    *,
++    x: torch.Tensor,
++    threshold: torch.Tensor,
++    inclusive: bool,
++    weight_t: torch.Tensor,
++    op_name: str = "activation_sparse_linear_direct_t",
++) -> None:
++    global _ASCEND_SPARSE_LINEAR_MARKED, _ASCEND_SPARSE_LINEAR_MARKER_RECORDS
++    if _is_torch_compiling():
++        return
++
++    marker_limit = _marker_record_limit()
++    if _ASCEND_SPARSE_LINEAR_MARKER_RECORDS >= marker_limit:
++        _ASCEND_SPARSE_LINEAR_MARKED = marker_limit > 0
++        return
++
++    marker_path = os.environ.get("VLLM_ASCEND_SPARSE_LINEAR_MARKER_PATH")
++    if not marker_path:
++        return
++    try:
++        marker_dir = os.path.dirname(marker_path)
++        if marker_dir:
++            os.makedirs(marker_dir, exist_ok=True)
++        payload: dict[str, Any] = {
++            "op": op_name,
++            "pid": os.getpid(),
++            "inclusive": bool(inclusive),
++            "marker_record": _ASCEND_SPARSE_LINEAR_MARKER_RECORDS + 1,
++        }
++        payload.update(_tensor_marker_payload("x", x))
++        payload.update(_tensor_marker_payload("threshold", threshold))
++        payload.update(_tensor_marker_payload("weight_t", weight_t))
++        with open(marker_path, "a", encoding="utf-8") as marker_file:
++            marker_file.write(json.dumps(payload, sort_keys=True) + "\n")
++        _ASCEND_SPARSE_LINEAR_MARKER_RECORDS += 1
++        _ASCEND_SPARSE_LINEAR_MARKED = (
++            _ASCEND_SPARSE_LINEAR_MARKER_RECORDS >= marker_limit
++        )
++    except OSError:
++        return
++
++
++def _try_ascend_direct_t_fast_path(
++    x: torch.Tensor,
++    weight_t: torch.Tensor | None,
++    threshold: torch.Tensor,
++    inclusive: bool,
++) -> torch.Tensor | None:
++    if weight_t is None:
++        return None
++    if not _is_npu_tensor(x):
++        return None
++    if x.dtype != torch.float16 or weight_t.dtype != torch.float16:
++        return None
++    if x.dim() != 2 or weight_t.dim() != 2:
++        return None
++    if x.shape[1] != weight_t.shape[0]:
++        return None
++    if not _threshold_numel_is_supported(threshold, x):
++        return None
++
++    op = _get_ascend_direct_t_op()
++    if op is None:
++        return None
++
++    if threshold.dtype != torch.float32 or threshold.device != x.device:
++        threshold = threshold.to(dtype=torch.float32, device=x.device)
++    if not threshold.is_contiguous():
++        threshold = threshold.contiguous()
++    _record_ascend_sparse_linear_marker(
++        x=x,
++        threshold=threshold,
++        inclusive=inclusive,
++        weight_t=weight_t,
++    )
++    return op(
++        x if x.is_contiguous() else x.contiguous(),
++        weight_t if weight_t.is_contiguous() else weight_t.contiguous(),
++        threshold,
++        inclusive,
++    )
++
++
++def _try_ascend_silu_and_mul_direct_t_fast_path(
++    x: torch.Tensor,
++    weight_t: torch.Tensor | None,
++    threshold: torch.Tensor,
++    inclusive: bool,
++) -> torch.Tensor | None:
++    if weight_t is None:
++        return None
++    if not _is_npu_tensor(x):
++        return None
++    if x.dtype != torch.float16 or weight_t.dtype != torch.float16:
++        return None
++    if x.dim() != 2 or weight_t.dim() != 2:
++        return None
++    if x.shape[1] != weight_t.shape[0] or weight_t.shape[1] % 2 != 0:
++        return None
++    if not _threshold_numel_is_supported(threshold, x):
++        return None
++
++    op = _get_ascend_silu_and_mul_direct_t_op()
++    if op is None:
++        return None
++
++    if threshold.dtype != torch.float32 or threshold.device != x.device:
++        threshold = threshold.to(dtype=torch.float32, device=x.device)
++    if not threshold.is_contiguous():
++        threshold = threshold.contiguous()
++    if _should_use_packed_silu_and_mul_t():
++        pack_op = _get_ascend_pack_op()
++        packed_op = _get_ascend_silu_and_mul_packed_t_op()
++        if pack_op is not None and packed_op is not None:
++            _record_ascend_sparse_linear_marker(
++                x=x,
++                threshold=threshold,
++                inclusive=inclusive,
++                weight_t=weight_t,
++                op_name="activation_sparse_silu_and_mul_packed_t",
++            )
++            values, indices, counts = pack_op(
++                x if x.is_contiguous() else x.contiguous(),
++                threshold,
++                inclusive,
++            )
++            return packed_op(
++                values,
++                indices,
++                counts,
++                weight_t if weight_t.is_contiguous() else weight_t.contiguous(),
++            )
++
++    _record_ascend_sparse_linear_marker(
++        x=x,
++        threshold=threshold,
++        inclusive=inclusive,
++        weight_t=weight_t,
++        op_name="activation_sparse_silu_and_mul_direct_t",
++    )
++    return op(
++        x if x.is_contiguous() else x.contiguous(),
++        weight_t if weight_t.is_contiguous() else weight_t.contiguous(),
++        threshold,
++        inclusive,
++    )
++
++
+ def sparse_gemv_impl(
+     x: torch.Tensor,
+     weight: torch.Tensor,
+@@ -151,11 +453,16 @@ def sparse_gemv_impl(
+         inclusive=inclusive,
+         weight_t=weight_t,
+     )
+-    try:
+-        from vllm_ascend.ops.sparse_linear import activation_sparse_linear
+-    except (ImportError, ModuleNotFoundError):
+-        activation_sparse_linear = None
++    fast_output = _try_ascend_direct_t_fast_path(
++        x,
++        weight_t,
++        threshold,
++        inclusive,
++    )
++    if fast_output is not None:
++        return fast_output
+ 
++    activation_sparse_linear = _get_ascend_sparse_linear()
+     if activation_sparse_linear is not None:
+         return activation_sparse_linear(
+             x,
+@@ -177,7 +484,8 @@ def sparse_gemv_impl(
+         "Ascend activation_sparse_linear is unavailable; using dense masked "
+         "fallback. Set use_sparse_gemv=False to silence this warning."
+     )
+-    threshold = threshold.to(dtype=torch.float32, device=x.device)
++    if threshold.dtype != torch.float32 or threshold.device != x.device:
++        threshold = threshold.to(dtype=torch.float32, device=x.device)
+     if threshold.numel() == 1:
+         threshold = threshold.reshape(1, 1)
+     else:
+@@ -191,6 +499,112 @@ def sparse_gemv_impl(
+     return torch.matmul(sparse_x, weight.t())
+ 
+ 
++def sparse_gemv_silu_and_mul_direct_t_cached_impl(
++    x: torch.Tensor,
++    weight: torch.Tensor,
++    weight_t: torch.Tensor,
++    threshold: torch.Tensor,
++    *,
++    inclusive: bool = False,
++) -> torch.Tensor | None:
++    """Apply fused sparse gate/up projection plus SiLU*up on Ascend."""
++    del weight
++    _record_sparse_gemv_invocation(
++        x=x,
++        threshold=threshold,
++        inclusive=inclusive,
++        weight_t=weight_t,
++    )
++    return _try_ascend_silu_and_mul_direct_t_fast_path(
++        x,
++        weight_t,
++        threshold,
++        inclusive,
++    )
++
++
++def sparse_gemv_topk_matmul_silu_impl(
++    x: torch.Tensor,
++    weight_t: torch.Tensor,
++    keep: int,
++) -> torch.Tensor | None:
++    """Apply La RoSA top-k sparse gate/up via selected-weight matmul on NPU."""
++    if not _is_npu_tensor(x):
++        return None
++    if x.dtype != torch.float16 or weight_t.dtype != torch.float16:
++        return None
++    if x.dim() != 2 or x.shape[0] != 1:
++        return None
++    if weight_t.dim() != 2 or x.shape[1] != weight_t.shape[0]:
++        return None
++    if weight_t.shape[1] % 2 != 0:
++        return None
++    if keep <= 0 or keep > x.shape[1]:
++        return None
++
++    magnitudes = x.abs().to(dtype=torch.float32)
++    topk_values, topk_indices = torch.topk(magnitudes, keep, dim=-1)
++    threshold = topk_values[..., -1].contiguous()
++    _record_sparse_gemv_invocation(
++        x=x,
++        threshold=threshold,
++        inclusive=True,
++        weight_t=weight_t,
++    )
++    _record_ascend_sparse_linear_marker(
++        x=x,
++        threshold=threshold,
++        inclusive=True,
++        weight_t=weight_t,
++        op_name="activation_sparse_topk_matmul_silu",
++    )
++
++    selected_indices = topk_indices[0].to(dtype=torch.long).contiguous()
++    selected_x = x[:, selected_indices].contiguous()
++    selected_weight_t = weight_t.index_select(0, selected_indices)
++    gate_up = torch.matmul(selected_x, selected_weight_t)
++    gate, up = gate_up.chunk(2, dim=-1)
++    return torch.nn.functional.silu(gate) * up
++
++
++def sparse_gemv_direct_t_cached_impl(
++    x: torch.Tensor,
++    weight: torch.Tensor,
++    weight_t: torch.Tensor,
++    threshold: torch.Tensor,
++    *,
++    inclusive: bool = False,
++) -> torch.Tensor | None:
++    """Fastest cached-plan path for already validated Ascend direct-T calls."""
++    if not _is_npu_tensor(x):
++        return None
++    if x.dtype != torch.float16 or weight_t.dtype != torch.float16:
++        return None
++    if threshold.dtype != torch.float32 or threshold.device != x.device:
++        return None
++    if not x.is_contiguous() or not weight_t.is_contiguous():
++        return None
++    if not threshold.is_contiguous():
++        return None
++    op = _get_ascend_direct_t_op()
++    if op is None:
++        return None
++
++    _record_sparse_gemv_invocation(
++        x=x,
++        threshold=threshold,
++        inclusive=inclusive,
++        weight_t=weight_t,
++    )
++    _record_ascend_sparse_linear_marker(
++        x=x,
++        threshold=threshold,
++        inclusive=inclusive,
++        weight_t=weight_t,
++    )
++    return op(x, weight_t, threshold, inclusive)
++
++
+ def can_use_sparse_gemv(
+     tp_size: int,
+     quant_config: Optional[Any],
+diff --git a/vllm/sparsity/layers.py b/vllm/sparsity/layers.py
+index c518ec8ebc2..674a3fdec2b 100644
+--- a/vllm/sparsity/layers.py
++++ b/vllm/sparsity/layers.py
+@@ -1,6 +1,8 @@
+ # SPDX-License-Identifier: Apache-2.0
+ """Layer helpers for injecting activation sparsity."""
+ 
++import os
++
+ import torch
+ from torch import nn
+ 
+@@ -17,6 +19,16 @@ from vllm.sparsity.utils import load_threshold
+ logger = init_logger(__name__)
+ 
+ 
++def _threshold_load_device(
++    device: torch.device | str,
++    sparsity_config: ActivationSparsityConfig,
++) -> torch.device | str:
++    if not sparsity_config.use_sparse_gemv:
++        return device
++    override = os.environ.get("VLLM_SPARSE_GEMV_THRESHOLD_DEVICE")
++    return override or device
++
++
+ def targets_projection(
+     sparsity_config: ActivationSparsityConfig,
+     proj_name: str,
+@@ -25,6 +37,14 @@ def targets_projection(
+     return target_projections is None or proj_name in target_projections
+ 
+ 
++def targets_layer(
++    sparsity_config: ActivationSparsityConfig,
++    layer_idx: int,
++) -> bool:
++    target_layers = sparsity_config.target_layers
++    return target_layers is None or layer_idx in target_layers
++
++
+ def build_sparsifier(
+     sparsity_config: ActivationSparsityConfig,
+     layer_idx: int,
+@@ -44,6 +64,8 @@ def build_sparsifier(
+     """
+     if not sparsity_config.enable:
+         return None
++    if not targets_layer(sparsity_config, layer_idx):
++        return None
+     if not targets_projection(sparsity_config, proj_name):
+         return None
+ 
+@@ -63,11 +85,12 @@ def build_sparsifier(
+         )
+ 
+     # Load pre-computed TEAL threshold for this layer/proj
++    threshold_device = _threshold_load_device(device, sparsity_config)
+     threshold = load_threshold(
+         sparsity_config.calibration_path,
+         layer_idx,
+         proj_name,
+-        device=str(device),
++        device=str(threshold_device),
+     )
+ 
+     sparsify_fn = SparsifyFn(
+@@ -153,6 +176,8 @@ def merge_larosa_rotation_into_linear(
+         return False
+     if not sparsity_config.enable or not sparsity_config.calibration_path:
+         return False
++    if not targets_layer(sparsity_config, layer_idx):
++        return False
+     if not targets_projection(sparsity_config, proj_name):
+         return False
+ 
+-- 
+2.53.0.windows.3
+

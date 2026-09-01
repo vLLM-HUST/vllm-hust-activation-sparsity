@@ -1,0 +1,640 @@
+From ada4b5933de8d319793f961a5cd4eac10a2a52a0 Mon Sep 17 00:00:00 2001
+From: Seas0 <season1277@outlook.com>
+Date: Thu, 7 May 2026 12:15:23 +0800
+Subject: [PATCH] [sparsity] Add vllm/sparsity/ core package
+
+Add ActivationSparsityConfig, Distribution, SparsifyFn, RotationTransform,
+build_sparsifier helper, threshold/histogram loading utilities, and
+sparse GEMV kernel placeholder for Phase 2.
+---
+ vllm/sparsity/__init__.py            |  21 ++++
+ vllm/sparsity/config.py              |  64 +++++++++++
+ vllm/sparsity/distribution.py        | 113 +++++++++++++++++++
+ vllm/sparsity/kernels/__init__.py    |   2 +
+ vllm/sparsity/kernels/sparse_gemv.py |  56 ++++++++++
+ vllm/sparsity/layers.py              |  85 ++++++++++++++
+ vllm/sparsity/rotation.py            |  63 +++++++++++
+ vllm/sparsity/utils.py               | 158 +++++++++++++++++++++++++++
+ 8 files changed, 562 insertions(+)
+ create mode 100644 vllm/sparsity/__init__.py
+ create mode 100644 vllm/sparsity/config.py
+ create mode 100644 vllm/sparsity/distribution.py
+ create mode 100644 vllm/sparsity/kernels/__init__.py
+ create mode 100644 vllm/sparsity/kernels/sparse_gemv.py
+ create mode 100644 vllm/sparsity/layers.py
+ create mode 100644 vllm/sparsity/rotation.py
+ create mode 100644 vllm/sparsity/utils.py
+
+diff --git a/vllm/sparsity/__init__.py b/vllm/sparsity/__init__.py
+new file mode 100644
+index 00000000000..c2ee3d03368
+--- /dev/null
++++ b/vllm/sparsity/__init__.py
+@@ -0,0 +1,21 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Activation sparsity support for vLLM (TEAL / La RoSA)."""
++
++from vllm.sparsity.config import ActivationSparsityConfig
++from vllm.sparsity.distribution import Distribution, SparsifyFn
++from vllm.sparsity.layers import build_sparsifier
++from vllm.sparsity.rotation import RotationTransform
++from vllm.sparsity.utils import (
++    get_activation_sparsity_config,
++    load_threshold,
++)
++
++__all__ = [
++    "ActivationSparsityConfig",
++    "build_sparsifier",
++    "Distribution",
++    "get_activation_sparsity_config",
++    "load_threshold",
++    "RotationTransform",
++    "SparsifyFn",
++]
+diff --git a/vllm/sparsity/config.py b/vllm/sparsity/config.py
+new file mode 100644
+index 00000000000..74a765dd3ba
+--- /dev/null
++++ b/vllm/sparsity/config.py
+@@ -0,0 +1,64 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Configuration for activation sparsity (TEAL / La RoSA)."""
++
++from typing import Optional
++
++from vllm.config.utils import config, get_hash_factors, hash_factors
++
++
++@config
++class ActivationSparsityConfig:
++    """Configuration for TEAL / La RoSA activation sparsity.
++
++    Phase 0 (MVP) defaults are chosen for correctness verification:
++    - ``apply_all_tokens=True`` to avoid prefill/decode detection complexity.
++    - ``strict_unsupported_check=True`` to fail fast on TP/quant/LoRA.
++    - ``use_sparse_gemv=False`` because sparse GEMV is a Phase 2 experiment.
++    """
++
++    # Master switch
++    enable: bool = False
++    """Whether to enable activation sparsity."""
++
++    # Method selection
++    method: str = "teal"
++    """Sparsity method: ``"teal"`` or ``"larosa"``."""
++
++    # Sparsity ratio
++    uniform_sparsity: float = 0.0
++    """Global uniform sparsity ratio in [0, 1]. 0.4 means 40% of activations
++    are zeroed out."""
++
++    # Calibration artifacts
++    calibration_path: Optional[str] = None
++    """Directory containing calibration artifacts:
++    ``histograms.pt``, per-layer ``threshold.pt``, and (for La RoSA)
++    ``D.pt`` / ``inv_D.pt``."""
++
++    # Decode-only guard
++    decode_only: bool = False
++    """If True, only apply sparsity during decode (not prefill).
++    Phase 0 defaults to False."""
++
++    # Phase 0 safety switch
++    apply_all_tokens: bool = True
++    """If True, apply sparsity to all tokens regardless of prefill/decode.
++    This simplifies Phase 0 correctness validation."""
++
++    # Unsupported combination guard
++    strict_unsupported_check: bool = True
++    """If True, raise an error when activation sparsity is combined with
++    unsupported features (tensor parallelism, quantization, LoRA)."""
++
++    # Phase 2 experimental flag
++    use_sparse_gemv: bool = False
++    """Enable Triton sparse GEMV custom op. Phase 2 experimental feature."""
++
++    def compute_hash(self) -> str:
++        """Return a hash that uniquely identifies this sparsity config.
++
++        Must be included in :meth:`VllmConfig.compute_hash` so that
++        compilation caches are invalidated when sparsity settings change.
++        """
++        factors = get_hash_factors(self, ignored_factors=set())
++        return hash_factors(factors)
+diff --git a/vllm/sparsity/distribution.py b/vllm/sparsity/distribution.py
+new file mode 100644
+index 00000000000..bb7cdcf7795
+--- /dev/null
++++ b/vllm/sparsity/distribution.py
+@@ -0,0 +1,113 @@
++# SPDX-License-Identifier: Apache-2.0
++"""TEAL distribution and sparsify function."""
++
++import torch
++from torch import nn
++
++from vllm.forward_context import get_forward_context
++
++
++class Distribution:
++    """Histogram-based distribution for threshold calibration.
++
++    Re-implements the core logic of TEAL's ``Distribution`` class
++    without depending on the original repository.
++    """
++
++    def __init__(self, histogram: torch.Tensor, bin_edges: torch.Tensor) -> None:
++        """Args:
++            histogram: 1-D tensor of counts per bin.
++            bin_edges: 1-D tensor of bin boundaries (length = histogram + 1).
++        """
++        if histogram.dim() != 1:
++            raise ValueError(f"histogram must be 1-D, got {histogram.dim()}-D")
++        if bin_edges.dim() != 1:
++            raise ValueError(f"bin_edges must be 1-D, got {bin_edges.dim()}-D")
++        if bin_edges.numel() != histogram.numel() + 1:
++            raise ValueError(
++                f"bin_edges length ({bin_edges.numel()}) must be "
++                f"histogram length ({histogram.numel()}) + 1"
++            )
++
++        self.histogram = histogram.float()
++        self.bin_edges = bin_edges.float()
++        self._pdf = self.histogram / self.histogram.sum()
++        self._cdf = self._pdf.cumsum(dim=0)
++
++    def icdf(self, q: float) -> float:
++        """Inverse CDF (quantile function) evaluated at ``q`` in [0, 1].
++
++        For a desired sparsity ``s``, the TEAL threshold is computed as
++        ``Distribution.icdf(0.5 + s / 2)`` because magnitudes are symmetric
++        around zero.
++        """
++        if not 0.0 <= q <= 1.0:
++            raise ValueError(f"q must be in [0, 1], got {q}")
++
++        # Find the first bin where CDF >= q
++        idx = torch.searchsorted(self._cdf, torch.tensor(q), side="right").item()
++        idx = min(idx, len(self.bin_edges) - 2)
++
++        # Linear interpolation within the bin
++        cdf_low = 0.0 if idx == 0 else self._cdf[idx - 1].item()
++        cdf_high = self._cdf[idx].item()
++        bin_width = (self.bin_edges[idx + 1] - self.bin_edges[idx]).item()
++
++        if cdf_high - cdf_low < 1e-12:
++            return self.bin_edges[idx].item()
++
++        t = (q - cdf_low) / (cdf_high - cdf_low)
++        return (self.bin_edges[idx] + t * bin_width).item()
++
++    @classmethod
++    def from_histograms(
++        cls, histograms: dict[str, torch.Tensor], bin_edges: torch.Tensor
++    ) -> dict[str, "Distribution"]:
++        """Build a dict of Distributions from a histogram dict."""
++        return {
++            name: cls(hist, bin_edges)
++            for name, hist in histograms.items()
++        }
++
++
++class SparsifyFn(nn.Module):
++    """PyTorch module that applies a magnitude-based sparsity mask.
++
++    For Phase 0 this uses a dense ``torch.where`` so that correctness
++    can be validated without requiring a sparse GEMV kernel.
++    """
++
++    def __init__(
++        self,
++        threshold: torch.Tensor,
++        apply_all_tokens: bool = True,
++    ) -> None:
++        super().__init__()
++        # Register as buffer so threshold moves with module.to(device/dtype)
++        self.register_buffer("threshold", threshold)
++        self.apply_all_tokens = apply_all_tokens
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        # Phase 0: apply to all tokens by default.
++        # Phase 1 will add decode-only detection here.
++        if not self.apply_all_tokens and not self._is_decode_only_batch():
++            return x
++        return torch.where(
++            x.abs() > self.threshold.to(dtype=x.dtype, device=x.device),
++            x,
++            torch.zeros_like(x),
++        )
++
++    def _is_decode_only_batch(self) -> bool:
++        """Return True if the current forward batch is decode-only.
++
++        Phase 1 implementation: inspect ForwardContext.attn_metadata.
++        For now always returns False so that ``apply_all_tokens`` controls
++        the behaviour.
++        """
++        # TODO(Phase 1): inspect get_forward_context().attn_metadata to
++        # determine whether every sequence in the batch has query_len == 1.
++        return False
++
++    def extra_repr(self) -> str:
++        return f"threshold={self.threshold.item():.4f}, apply_all_tokens={self.apply_all_tokens}"
+diff --git a/vllm/sparsity/kernels/__init__.py b/vllm/sparsity/kernels/__init__.py
+new file mode 100644
+index 00000000000..3aa86690a27
+--- /dev/null
++++ b/vllm/sparsity/kernels/__init__.py
+@@ -0,0 +1,2 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Sparse kernels for activation sparsity (Phase 2+)."""
+diff --git a/vllm/sparsity/kernels/sparse_gemv.py b/vllm/sparsity/kernels/sparse_gemv.py
+new file mode 100644
+index 00000000000..a72bed825c2
+--- /dev/null
++++ b/vllm/sparsity/kernels/sparse_gemv.py
+@@ -0,0 +1,56 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Triton sparse GEMV kernel for TEAL (Phase 2 experimental).
++
++This module is a placeholder for the TEAL Triton sparse GEMV kernel.
++When ``use_sparse_gemv=True`` and all constraints are satisfied:
++  - tp_size == 1
++  - quant_config is None
++  - LoRA is disabled
++  - dtype in (float16, bfloat16)
++  - decode-only batch
++
++a custom op registered via ``direct_register_custom_op`` will be called.
++"""
++
++from typing import Any, Optional
++
++import torch
++
++from vllm.logger import init_logger
++
++logger = init_logger(__name__)
++
++
++def sparse_gemv_impl(
++    x: torch.Tensor,
++    weight: torch.Tensor,
++    threshold: torch.Tensor,
++    sparsity_bin: int = 0,
++) -> torch.Tensor:
++    """Placeholder implementation: falls back to dense GEMV.
++
++    The real Triton kernel will be added in Phase 2.
++    """
++    logger.warning_once(
++        "sparse_gemv_impl is a placeholder; using dense fallback. "
++        "Set use_sparse_gemv=False to silence this warning."
++    )
++    return torch.matmul(x, weight.t())
++
++
++def can_use_sparse_gemv(
++    tp_size: int,
++    quant_config: Optional[Any],
++    dtype: torch.dtype,
++    use_sparse_gemv_flag: bool = False,
++) -> bool:
++    """Return True if the strict constraints for sparse GEMV are met."""
++    if not use_sparse_gemv_flag:
++        return False
++    if tp_size != 1:
++        return False
++    if quant_config is not None:
++        return False
++    if dtype not in (torch.float16, torch.bfloat16):
++        return False
++    return True
+diff --git a/vllm/sparsity/layers.py b/vllm/sparsity/layers.py
+new file mode 100644
+index 00000000000..d8e3a1778bd
+--- /dev/null
++++ b/vllm/sparsity/layers.py
+@@ -0,0 +1,85 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Layer helpers for injecting activation sparsity."""
++
++import os
++from typing import Optional
++
++import torch
++
++from vllm.logger import init_logger
++from vllm.sparsity.config import ActivationSparsityConfig
++from vllm.sparsity.distribution import SparsifyFn
++from vllm.sparsity.rotation import RotationTransform
++from vllm.sparsity.utils import load_threshold
++
++logger = init_logger(__name__)
++
++
++def build_sparsifier(
++    sparsity_config: ActivationSparsityConfig,
++    layer_idx: int,
++    proj_name: str,
++    device: torch.device | str = "cpu",
++) -> Optional[SparsifyFn]:
++    """Build a :class:`SparsifyFn` for a given layer and projection.
++
++    Args:
++        sparsity_config: The activation sparsity configuration.
++        layer_idx: Layer index.
++        proj_name: Projection name, e.g. ``"mlp.gate_up"``, ``"self_attn.qkv"``.
++        device: Device to load the threshold onto.
++
++    Returns:
++        A :class:`SparsifyFn` instance, or ``None`` if sparsity is disabled.
++    """
++    if not sparsity_config.enable:
++        return None
++
++    if not sparsity_config.calibration_path:
++        logger.warning_once(
++            "activation_sparsity.enable=True but calibration_path is not set. "
++            "Sparsity will not be applied."
++        )
++        return None
++
++    # Load pre-computed threshold for this layer/proj
++    threshold = load_threshold(
++        sparsity_config.calibration_path,
++        layer_idx,
++        proj_name,
++        device=str(device),
++    )
++
++    sparsify_fn = SparsifyFn(
++        threshold=threshold,
++        apply_all_tokens=sparsity_config.apply_all_tokens,
++    )
++
++    # La RoSA: wrap with rotation if D/inv_D exist
++    if sparsity_config.method == "larosa":
++        rotation_dir = os.path.join(
++            sparsity_config.calibration_path,
++            f"layers.{layer_idx}.{proj_name}",
++        )
++        d_path = os.path.join(rotation_dir, "D.pt")
++        inv_d_path = os.path.join(rotation_dir, "inv_D.pt")
++        if os.path.exists(d_path) and os.path.exists(inv_d_path):
++            rotation = RotationTransform(d_path=d_path, inv_d_path=inv_d_path)
++            # Attach rotation to the sparsify_fn module so it moves together
++            sparsify_fn.rotation = rotation  # type: ignore[attr-defined]
++            # Monkey-patch forward to include rotation
++            _orig_forward = sparsify_fn.forward
++
++            def _rotated_forward(x: torch.Tensor) -> torch.Tensor:
++                x_rot = rotation(x)
++                x_sparse = _orig_forward(x_rot)
++                return rotation.inverse(x_sparse).to(x.dtype)
++
++            sparsify_fn.forward = _rotated_forward  # type: ignore[method-assign]
++            logger.debug(
++                "La RoSA rotation enabled for layer %d projection %s",
++                layer_idx,
++                proj_name,
++            )
++
++    return sparsify_fn
+diff --git a/vllm/sparsity/rotation.py b/vllm/sparsity/rotation.py
+new file mode 100644
+index 00000000000..d19d29608ea
+--- /dev/null
++++ b/vllm/sparsity/rotation.py
+@@ -0,0 +1,63 @@
++# SPDX-License-Identifier: Apache-2.0
++"""La RoSA rotation matrix support."""
++
++import torch
++from torch import nn
++
++
++class RotationTransform(nn.Module):
++    """Wrapper for La RoSA rotation matrix ``D`` and its inverse ``inv_D``.
++
++    Applies ``x @ D`` before sparsification and ``x @ inv_D`` after.
++    Both matrices are registered as buffers so they follow the module's
++    device/dtype automatically.
++
++    Phase 3 only: La RoSA is not part of the Phase 0 MVP.
++    """
++
++    def __init__(
++        self,
++        d_path: str | None = None,
++        inv_d_path: str | None = None,
++        d_matrix: torch.Tensor | None = None,
++        inv_d_matrix: torch.Tensor | None = None,
++    ) -> None:
++        """Args:
++            d_path: Path to a ``.pt`` file containing ``D``.
++            inv_d_path: Path to a ``.pt`` file containing ``inv_D``.
++            d_matrix: ``D`` tensor (alternative to ``d_path``).
++            inv_d_matrix: ``inv_D`` tensor (alternative to ``inv_d_path``).
++        """
++        super().__init__()
++
++        if d_matrix is not None:
++            d = d_matrix
++        elif d_path is not None:
++            d = torch.load(d_path, map_location="cpu", weights_only=True)
++        else:
++            raise ValueError("One of d_path or d_matrix must be provided")
++
++        if inv_d_matrix is not None:
++            inv_d = inv_d_matrix
++        elif inv_d_path is not None:
++            inv_d = torch.load(
++                inv_d_path, map_location="cpu", weights_only=True
++            )
++        else:
++            raise ValueError(
++                "One of inv_d_path or inv_d_matrix must be provided"
++            )
++
++        self.register_buffer("D", d)
++        self.register_buffer("inv_D", inv_d)
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        """Apply rotation: ``x @ D``."""
++        return torch.matmul(x.to(self.D.dtype), self.D)
++
++    def inverse(self, x: torch.Tensor) -> torch.Tensor:
++        """Apply inverse rotation: ``x @ inv_D``."""
++        return torch.matmul(x.to(self.inv_D.dtype), self.inv_D)
++
++    def extra_repr(self) -> str:
++        return f"D_shape={tuple(self.D.shape)}, inv_D_shape={tuple(self.inv_D.shape)}"
+diff --git a/vllm/sparsity/utils.py b/vllm/sparsity/utils.py
+new file mode 100644
+index 00000000000..eeb4581bdd2
+--- /dev/null
++++ b/vllm/sparsity/utils.py
+@@ -0,0 +1,158 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Utilities for activation sparsity calibration loading."""
++
++import glob
++import json
++import os
++from typing import Any
++
++import torch
++
++from vllm.logger import init_logger
++from vllm.model_executor.model_loader.weight_utils import (
++    get_lock,
++    maybe_download_from_modelscope,
++)
++from vllm.sparsity.config import ActivationSparsityConfig
++from vllm.sparsity.distribution import Distribution
++
++logger = init_logger(__name__)
++
++
++def load_threshold(
++    calibration_path: str,
++    layer_idx: int,
++    proj_name: str,
++    device: str = "cpu",
++) -> torch.Tensor:
++    """Load a pre-computed threshold tensor for a specific layer and projection.
++
++    Args:
++        calibration_path: Directory containing calibration artifacts.
++        layer_idx: Layer index (e.g. 0, 1, 2).
++        proj_name: Projection name (e.g. ``"mlp.gate_up"``, ``"self_attn.qkv"``).
++        device: Device to load the tensor onto.
++
++    Returns:
++        A 0-D or 1-D threshold tensor.
++
++    Raises:
++        FileNotFoundError: If no threshold file is found for the layer/proj.
++    """
++    # Expected filenames (in order of preference):
++    # layers.0.mlp.gate_up.threshold.pt
++    # layers.0.self_attn.qkv.threshold.pt
++    basename = f"layers.{layer_idx}.{proj_name}.threshold.pt"
++    path = os.path.join(calibration_path, basename)
++
++    if not os.path.exists(path):
++        # Fallback: glob for any matching file
++        pattern = os.path.join(
++            calibration_path, f"layers.{layer_idx}.{proj_name}*.pt"
++        )
++        matches = glob.glob(pattern)
++        if matches:
++            path = matches[0]
++        else:
++            raise FileNotFoundError(
++                f"Threshold file not found for layer {layer_idx}, "
++                f"projection '{proj_name}' (looked for {basename})"
++            )
++
++    threshold = torch.load(path, map_location=device, weights_only=True)
++    if not isinstance(threshold, torch.Tensor):
++        threshold = torch.tensor(threshold, dtype=torch.float32, device=device)
++    return threshold
++
++
++def compute_thresholds_from_histograms(
++    histograms_path: str,
++    sparsity: float,
++    device: str = "cpu",
++) -> dict[str, torch.Tensor]:
++    """Compute per-projection thresholds from a histograms.pt file.
++
++    Args:
++        histograms_path: Path to ``histograms.pt``.
++        sparsity: Target sparsity ratio in [0, 1].
++        device: Device to place the resulting tensors on.
++
++    Returns:
++        Dict mapping projection name to threshold tensor.
++    """
++    data = torch.load(histograms_path, map_location="cpu", weights_only=False)
++    # Expected structure:
++    # {
++    #   "histograms": {"layers.0.mlp.gate_up": tensor, ...},
++    #   "bin_edges": tensor,
++    # }
++    histograms = data.get("histograms", data)
++    bin_edges = data.get("bin_edges", None)
++
++    if bin_edges is None:
++        raise ValueError(
++            "histograms file must contain 'bin_edges' to compute thresholds"
++        )
++
++    dists = Distribution.from_histograms(histograms, bin_edges)
++    q = 0.5 + sparsity / 2.0
++    thresholds = {
++        name: torch.tensor(d.icdf(q), dtype=torch.float32, device=device)
++        for name, d in dists.items()
++    }
++    return thresholds
++
++
++def get_activation_sparsity_config(
++    model_config: Any,
++    load_config: Any,
++    config_filename: str = "activation_sparsity_config.json",
++) -> dict[str, Any]:
++    """Look for ``activation_sparsity_config.json`` in the model directory.
++
++    Follows the same remote/local resolution pattern as
++    :func:`get_sparse_attention_config`.
++
++    Args:
++        model_config: The model config (usually ``ModelConfig``).
++        load_config: The load config (usually ``LoadConfig``).
++        config_filename: Name of the JSON config file to look for.
++
++    Returns:
++        The parsed JSON dict, or ``{}`` if the file does not exist.
++    """
++    import huggingface_hub
++    from huggingface_hub import snapshot_download
++    from huggingface_hub.utils import DisabledTqdm
++
++    model_name_or_path = getattr(model_config, "model", None)
++    if model_name_or_path is None:
++        return {}
++
++    model_name_or_path = (
++        maybe_download_from_modelscope(model_name_or_path, None)
++        or model_name_or_path
++    )
++    is_local = os.path.isdir(model_name_or_path)
++
++    if not is_local:
++        with get_lock(model_name_or_path, load_config.download_dir):
++            hf_folder = snapshot_download(
++                model_name_or_path,
++                revision=getattr(model_config, "revision", None),
++                allow_patterns="*.json",
++                cache_dir=load_config.download_dir,
++                local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
++                tqdm_class=DisabledTqdm,
++            )
++    else:
++        hf_folder = model_name_or_path
++
++    config_file = os.path.join(hf_folder, config_filename)
++    if not os.path.exists(config_file):
++        return {}
++
++    with open(config_file) as f:
++        config = json.load(f)
++    logger.info("Loaded activation sparsity config from %s", config_file)
++    return config
+-- 
+2.53.0.windows.3
+

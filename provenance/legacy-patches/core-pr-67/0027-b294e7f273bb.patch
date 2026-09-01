@@ -1,0 +1,25 @@
+From b294e7f273bb36fac6868aea766dd3b1d8942dce Mon Sep 17 00:00:00 2001
+From: Seas0 <season1277@outlook.com>
+Date: Thu, 16 Jul 2026 21:13:50 +0800
+Subject: [PATCH] fix: disable progress in sparse throughput timing
+
+---
+ scripts/bench_sparse_kernel_throughput.py | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/scripts/bench_sparse_kernel_throughput.py b/scripts/bench_sparse_kernel_throughput.py
+index b8d171eb822..538c51de752 100644
+--- a/scripts/bench_sparse_kernel_throughput.py
++++ b/scripts/bench_sparse_kernel_throughput.py
+@@ -349,7 +349,7 @@ def run_case(
+     synchronize()
+     try:
+         start = time.perf_counter()
+-        outputs = llm.generate(prompts, sampling_params, use_tqdm=True)
++        outputs = llm.generate(prompts, sampling_params, use_tqdm=False)
+         synchronize()
+         elapsed = time.perf_counter() - start
+     finally:
+-- 
+2.53.0.windows.3
+

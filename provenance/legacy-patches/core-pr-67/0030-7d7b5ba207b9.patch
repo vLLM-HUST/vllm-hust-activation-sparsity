@@ -1,0 +1,296 @@
+From 7d7b5ba207b9c511d110c2e23da4c10176015046 Mon Sep 17 00:00:00 2001
+From: "Shuhao Zhang (Tony)" <shuhao_zhang@hust.edu.cn>
+Date: Sun, 19 Jul 2026 22:56:07 +0800
+Subject: [PATCH] style(sparsity): align validation code with lint
+
+Apply the repository Ruff rules to the sparse runtime, benchmark gate, and focused tests after the latest main merge.
+---
+ scripts/bench_sparse_kernel_throughput.py     |  1 -
+ scripts/generate_sparse_exp_fixtures.py       |  1 -
+ scripts/run_sparse_quality_throughput_gate.py | 24 ++++++++++++++-----
+ .../test_eval_larosa_ppl_alignment.py         |  2 +-
+ tests/sparsity/test_llama_integration.py      | 20 ++++++++++++----
+ .../test_sparse_quality_throughput_gate.py    |  2 +-
+ tests/sparsity/test_utils.py                  |  6 ++---
+ vllm/sparsity/kernels/sparse_gemv.py          | 16 ++++++-------
+ vllm/sparsity/logits_processors.py            |  1 -
+ vllm/sparsity/utils.py                        |  2 +-
+ 10 files changed, 46 insertions(+), 29 deletions(-)
+
+diff --git a/scripts/bench_sparse_kernel_throughput.py b/scripts/bench_sparse_kernel_throughput.py
+index 538c51de7..ed25c6683 100644
+--- a/scripts/bench_sparse_kernel_throughput.py
++++ b/scripts/bench_sparse_kernel_throughput.py
+@@ -18,7 +18,6 @@ from typing import Any
+ 
+ import torch
+ 
+-
+ os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+ 
+ SPARSE_MARKER_ENV_NAMES = (
+diff --git a/scripts/generate_sparse_exp_fixtures.py b/scripts/generate_sparse_exp_fixtures.py
+index 1113fcce7..51d4e09ca 100644
+--- a/scripts/generate_sparse_exp_fixtures.py
++++ b/scripts/generate_sparse_exp_fixtures.py
+@@ -9,7 +9,6 @@ from tokenizers.models import WordLevel
+ from tokenizers.pre_tokenizers import Whitespace
+ from transformers import LlamaConfig, LlamaForCausalLM, PreTrainedTokenizerFast
+ 
+-
+ ROOT = Path(".cache/ascend_sparse_experiments")
+ MODEL_DIR = ROOT / "tiny_llama_model"
+ TEAL_ROOT = ROOT / "teal_tiny_s0.50"
+diff --git a/scripts/run_sparse_quality_throughput_gate.py b/scripts/run_sparse_quality_throughput_gate.py
+index d7060c8da..7c50c0beb 100644
+--- a/scripts/run_sparse_quality_throughput_gate.py
++++ b/scripts/run_sparse_quality_throughput_gate.py
+@@ -18,7 +18,6 @@ import sys
+ from pathlib import Path
+ from typing import Any
+ 
+-
+ SCRIPT_DIR = Path(__file__).resolve().parent
+ DEFAULT_OUTPUT_ROOT = Path(".cache/sparse_kernel_results")
+ SUPPORTED_PROJECTIONS = (
+@@ -334,7 +333,11 @@ def build_throughput_command(args: argparse.Namespace, output_path: Path) -> lis
+     append_repeated(command, "--inline-text", args.inline_text)
+     append_repeated(command, "--target-projection", args.target_projection)
+     append_repeated(command, "--target-layer", args.target_layer)
+-    append_if_value(command, "--sparse-gemv-min-sparsity", args.sparse_gemv_min_sparsity)
++    append_if_value(
++        command,
++        "--sparse-gemv-min-sparsity",
++        args.sparse_gemv_min_sparsity,
++    )
+     append_if_value(command, "--sparse-marker-limit", args.sparse_marker_limit)
+     if args.trust_remote_code:
+         command.append("--trust-remote-code")
+@@ -447,10 +450,13 @@ def validate_ppl_result(
+         return metrics, failures
+ 
+     if setup.get("model") != args.model:
+-        failures.append(f"PPL model mismatch: expected {args.model}, got {setup.get('model')}")
++        failures.append(
++            f"PPL model mismatch: expected {args.model}, got {setup.get('model')}"
++        )
+     if not math.isclose(float(setup.get("sparsity", -1.0)), args.sparsity):
+         failures.append(
+-            f"PPL sparsity mismatch: expected {args.sparsity}, got {setup.get('sparsity')}"
++            "PPL sparsity mismatch: "
++            f"expected {args.sparsity}, got {setup.get('sparsity')}"
+         )
+     if setup.get("vllm_score_mode") != args.vllm_score_mode:
+         failures.append(
+@@ -469,7 +475,12 @@ def validate_ppl_result(
+         "vllm_target_projections",
+         setup.get("target_projections"),
+     )
+-    compare_optional_list(failures, "PPL target layers", args.target_layer, setup_layers)
++    compare_optional_list(
++        failures,
++        "PPL target layers",
++        args.target_layer,
++        setup_layers,
++    )
+     compare_optional_list(
+         failures,
+         "PPL target projections",
+@@ -519,7 +530,8 @@ def validate_throughput_result(
+ 
+     if data.get("method") != args.method:
+         failures.append(
+-            f"throughput method mismatch: expected {args.method}, got {data.get('method')}"
++            "throughput method mismatch: "
++            f"expected {args.method}, got {data.get('method')}"
+         )
+     if data.get("model") != args.model:
+         failures.append(
+diff --git a/tests/sparsity/test_eval_larosa_ppl_alignment.py b/tests/sparsity/test_eval_larosa_ppl_alignment.py
+index 7b2440fd5..0aad83b7a 100644
+--- a/tests/sparsity/test_eval_larosa_ppl_alignment.py
++++ b/tests/sparsity/test_eval_larosa_ppl_alignment.py
+@@ -1,7 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ 
+-from pathlib import Path
+ import sys
++from pathlib import Path
+ from types import SimpleNamespace
+ 
+ import pytest
+diff --git a/tests/sparsity/test_llama_integration.py b/tests/sparsity/test_llama_integration.py
+index bb4d0ee10..dab5f7e97 100644
+--- a/tests/sparsity/test_llama_integration.py
++++ b/tests/sparsity/test_llama_integration.py
+@@ -24,8 +24,14 @@ def test_llama_mlp_sparsity_injection():
+     from vllm.sparsity.layers import build_sparsifier
+ 
+     with tempfile.TemporaryDirectory() as tmpdir:
+-        torch.save(torch.tensor(0.3), os.path.join(tmpdir, "layers.2.mlp.gate_up.threshold.pt"))
+-        torch.save(torch.tensor(0.4), os.path.join(tmpdir, "layers.2.mlp.down.threshold.pt"))
++        torch.save(
++            torch.tensor(0.3),
++            os.path.join(tmpdir, "layers.2.mlp.gate_up.threshold.pt"),
++        )
++        torch.save(
++            torch.tensor(0.4),
++            os.path.join(tmpdir, "layers.2.mlp.down.threshold.pt"),
++        )
+ 
+         cfg = ActivationSparsityConfig(enable=True, calibration_path=tmpdir)
+         gate_up = build_sparsifier(cfg, layer_idx=2, proj_name="mlp.gate_up")
+@@ -46,8 +52,14 @@ def test_llama_attention_sparsity_injection():
+     from vllm.sparsity.layers import build_sparsifier
+ 
+     with tempfile.TemporaryDirectory() as tmpdir:
+-        torch.save(torch.tensor(0.3), os.path.join(tmpdir, "layers.0.self_attn.qkv.threshold.pt"))
+-        torch.save(torch.tensor(0.4), os.path.join(tmpdir, "layers.0.self_attn.o.threshold.pt"))
++        torch.save(
++            torch.tensor(0.3),
++            os.path.join(tmpdir, "layers.0.self_attn.qkv.threshold.pt"),
++        )
++        torch.save(
++            torch.tensor(0.4),
++            os.path.join(tmpdir, "layers.0.self_attn.o.threshold.pt"),
++        )
+ 
+         cfg = ActivationSparsityConfig(enable=True, calibration_path=tmpdir)
+         qkv = build_sparsifier(cfg, layer_idx=0, proj_name="self_attn.qkv")
+diff --git a/tests/sparsity/test_sparse_quality_throughput_gate.py b/tests/sparsity/test_sparse_quality_throughput_gate.py
+index 349aa17f9..0fe9c5ade 100644
+--- a/tests/sparsity/test_sparse_quality_throughput_gate.py
++++ b/tests/sparsity/test_sparse_quality_throughput_gate.py
+@@ -1,7 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ 
+-from pathlib import Path
+ import sys
++from pathlib import Path
+ from types import SimpleNamespace
+ 
+ SCRIPT_DIR = Path(__file__).resolve().parents[2] / "scripts"
+diff --git a/tests/sparsity/test_utils.py b/tests/sparsity/test_utils.py
+index 1d2f02307..8c2c9a19a 100644
+--- a/tests/sparsity/test_utils.py
++++ b/tests/sparsity/test_utils.py
+@@ -1,6 +1,5 @@
+ # SPDX-License-Identifier: Apache-2.0
+ 
+-import json
+ import os
+ import tempfile
+ 
+@@ -24,9 +23,8 @@ def test_load_threshold_success():
+ 
+ 
+ def test_load_threshold_missing():
+-    with tempfile.TemporaryDirectory() as tmpdir:
+-        with pytest.raises(FileNotFoundError):
+-            load_threshold(tmpdir, layer_idx=0, proj_name="mlp.down")
++    with tempfile.TemporaryDirectory() as tmpdir, pytest.raises(FileNotFoundError):
++        load_threshold(tmpdir, layer_idx=0, proj_name="mlp.down")
+ 
+ 
+ def test_compute_thresholds_from_histograms():
+diff --git a/vllm/sparsity/kernels/sparse_gemv.py b/vllm/sparsity/kernels/sparse_gemv.py
+index d148bb920..dcd0c64b9 100644
+--- a/vllm/sparsity/kernels/sparse_gemv.py
++++ b/vllm/sparsity/kernels/sparse_gemv.py
+@@ -14,7 +14,7 @@ available. Other backends use a dense masked fallback for correctness.
+ 
+ import json
+ import os
+-from typing import Any, Optional
++from typing import Any
+ 
+ import torch
+ 
+@@ -279,7 +279,7 @@ def _record_sparse_gemv_invocation(
+         return
+ 
+     marker_limit = _marker_record_limit()
+-    if _SPARSE_GEMV_MARKER_RECORDS >= marker_limit:
++    if marker_limit <= _SPARSE_GEMV_MARKER_RECORDS:
+         _SPARSE_GEMV_MARKED = marker_limit > 0
+         return
+     marker_path = os.environ.get("VLLM_SPARSE_GEMV_MARKER_PATH")
+@@ -307,7 +307,7 @@ def _record_sparse_gemv_invocation(
+         with open(marker_path, "a", encoding="utf-8") as marker_file:
+             marker_file.write(json.dumps(payload, sort_keys=True) + "\n")
+         _SPARSE_GEMV_MARKER_RECORDS += 1
+-        _SPARSE_GEMV_MARKED = _SPARSE_GEMV_MARKER_RECORDS >= marker_limit
++        _SPARSE_GEMV_MARKED = marker_limit <= _SPARSE_GEMV_MARKER_RECORDS
+     except OSError:
+         logger.warning("Failed to write sparse GEMV marker to %s", marker_path)
+ 
+@@ -326,7 +326,7 @@ def _record_ascend_sparse_linear_marker(
+         return
+ 
+     marker_limit = _marker_record_limit()
+-    if _ASCEND_SPARSE_LINEAR_MARKER_RECORDS >= marker_limit:
++    if marker_limit <= _ASCEND_SPARSE_LINEAR_MARKER_RECORDS:
+         _ASCEND_SPARSE_LINEAR_MARKED = marker_limit > 0
+         return
+ 
+@@ -351,7 +351,7 @@ def _record_ascend_sparse_linear_marker(
+             marker_file.write(json.dumps(payload, sort_keys=True) + "\n")
+         _ASCEND_SPARSE_LINEAR_MARKER_RECORDS += 1
+         _ASCEND_SPARSE_LINEAR_MARKED = (
+-            _ASCEND_SPARSE_LINEAR_MARKER_RECORDS >= marker_limit
++            marker_limit <= _ASCEND_SPARSE_LINEAR_MARKER_RECORDS
+         )
+     except OSError:
+         return
+@@ -650,7 +650,7 @@ def sparse_gemv_direct_t_cached_impl(
+ 
+ def can_use_sparse_gemv(
+     tp_size: int,
+-    quant_config: Optional[Any],
++    quant_config: Any | None,
+     dtype: torch.dtype,
+     use_sparse_gemv_flag: bool = False,
+ ) -> bool:
+@@ -661,6 +661,4 @@ def can_use_sparse_gemv(
+         return False
+     if quant_config is not None:
+         return False
+-    if dtype not in (torch.float16, torch.bfloat16):
+-        return False
+-    return True
++    return dtype in (torch.float16, torch.bfloat16)
+diff --git a/vllm/sparsity/logits_processors.py b/vllm/sparsity/logits_processors.py
+index 35189cd48..783e9a8d8 100644
+--- a/vllm/sparsity/logits_processors.py
++++ b/vllm/sparsity/logits_processors.py
+@@ -10,7 +10,6 @@ import torch
+ from vllm.sampling_params import SamplingParams
+ from vllm.v1.sample.logits_processor import AdapterLogitsProcessor
+ 
+-
+ FORCE_FIRST_TOKEN_EXTRA_ARG = "force_first_token_id"
+ 
+ 
+diff --git a/vllm/sparsity/utils.py b/vllm/sparsity/utils.py
+index e53630a6e..b397b0c3c 100644
+--- a/vllm/sparsity/utils.py
++++ b/vllm/sparsity/utils.py
+@@ -9,7 +9,6 @@ from typing import Any
+ import torch
+ 
+ from vllm.logger import init_logger
+-from vllm.sparsity.config import ActivationSparsityConfig
+ from vllm.sparsity.distribution import Distribution
+ 
+ logger = init_logger(__name__)
+@@ -119,6 +118,7 @@ def get_activation_sparsity_config(
+     """
+     import huggingface_hub
+     from huggingface_hub import snapshot_download
++
+     from vllm.model_executor.model_loader.weight_utils import (
+         DisabledTqdm,
+         get_lock,
+-- 
+2.53.0.windows.3
+

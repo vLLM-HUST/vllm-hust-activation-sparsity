@@ -1,0 +1,389 @@
+From c1bd55bfb8613abed0851c70c81449a620dadcd9 Mon Sep 17 00:00:00 2001
+From: Junhui Zhang <junhui.zhang@novita.ai>
+Date: Mon, 10 Aug 2026 16:05:26 +0800
+Subject: [PATCH] fix(ci): preserve diagnostics for malformed scenario
+ summaries
+
+---
+ .../build_ascend_benchmark_diagnostics.py     | 233 +++++++++++++-----
+ tests/ci/test_ascend_benchmark_diagnostics.py |  94 +++++++
+ 2 files changed, 268 insertions(+), 59 deletions(-)
+
+diff --git a/.github/workflows/scripts/build_ascend_benchmark_diagnostics.py b/.github/workflows/scripts/build_ascend_benchmark_diagnostics.py
+index 87a9277bf..3071aab19 100644
+--- a/.github/workflows/scripts/build_ascend_benchmark_diagnostics.py
++++ b/.github/workflows/scripts/build_ascend_benchmark_diagnostics.py
+@@ -22,6 +22,14 @@ REQUIRED_EVIDENCE = (
+     "checksums.sha256",
+ )
+ HEX_DIGITS = frozenset("0123456789abcdef")
++SCENARIO_SUMMARY_FIELDS = (
++    "scenario",
++    "run_id",
++    "result_root",
++    "raw_result",
++    "submission_dir",
++    "exit_code",
++)
+ 
+ 
+ def _parse_exit_code(value: Any) -> int | None:
+@@ -110,6 +118,41 @@ def _raw_result_is_valid(path: Path) -> bool:
+     return isinstance(payload, dict)
+ 
+ 
++def _rejected_scenario(
++    bench_scenario: str,
++    run_id: str,
++    formal_exit_code: int | None,
++    reason: str,
++    *,
++    row: dict[str | None, Any] | None = None,
++) -> dict[str, Any]:
++    row = row or {}
++    scenario_value = row.get("scenario")
++    run_id_value = row.get("run_id")
++    scenario = (
++        scenario_value.strip()
++        if isinstance(scenario_value, str) and scenario_value.strip()
++        else bench_scenario
++    )
++    scenario_run_id = (
++        run_id_value.strip()
++        if isinstance(run_id_value, str) and run_id_value.strip()
++        else run_id
++    )
++    row_exit_code = _parse_exit_code(row.get("exit_code"))
++    return {
++        "scenario": scenario,
++        "run_id": scenario_run_id,
++        "status": "failed",
++        "exit_code": (row_exit_code if row_exit_code is not None else formal_exit_code),
++        "result_root": "rejected",
++        "raw_result": "rejected",
++        "submission_dir": "rejected",
++        "path_errors": [reason],
++        "_submission_path": None,
++    }
++
++
+ def load_scenarios(
+     result_root: Path,
+     summary_path: Path,
+@@ -124,70 +167,142 @@ def load_scenarios(
+             summary_path, result_root
+         ):
+             return [
+-                {
+-                    "scenario": bench_scenario,
+-                    "run_id": run_id,
+-                    "status": "failed",
+-                    "exit_code": formal_exit_code,
+-                    "result_root": "rejected",
+-                    "raw_result": "rejected",
+-                    "submission_dir": "rejected",
+-                    "path_errors": [
+-                        "scenario summary escapes the benchmark result root"
+-                    ],
+-                    "_submission_path": None,
+-                }
++                _rejected_scenario(
++                    bench_scenario,
++                    run_id,
++                    formal_exit_code,
++                    "scenario summary escapes the benchmark result root",
++                )
+             ]
+-        with summary_path.open(encoding="utf-8", newline="") as summary_file:
+-            for row in csv.DictReader(summary_file, delimiter="\t"):
+-                scenario_root = _candidate_path(row["result_root"], result_root)
+-                submission_dir = _candidate_path(row["submission_dir"], result_root)
+-                raw_result = _candidate_path(row["raw_result"], result_root)
+-                command_exit_code = _parse_exit_code(row.get("exit_code"))
+-                path_errors = []
+-                if not _path_is_contained(scenario_root, result_root):
+-                    path_errors.append("result_root escapes the benchmark result root")
+-                if not _path_is_contained(raw_result, scenario_root):
+-                    path_errors.append("raw_result escapes the scenario result root")
+-                if not _path_is_contained(submission_dir, scenario_root):
+-                    path_errors.append("submission_dir escapes scenario root")
+-
+-                status_path = submission_dir / "STATUS"
+-                execution_passed = False
+-                if not path_errors and _raw_result_is_valid(raw_result):
++        try:
++            with summary_path.open(encoding="utf-8", newline="") as summary_file:
++                reader = csv.DictReader(summary_file, delimiter="\t", strict=True)
++                missing_columns = [
++                    field
++                    for field in SCENARIO_SUMMARY_FIELDS
++                    if field not in (reader.fieldnames or [])
++                ]
++                saw_row = False
++                for row in reader:
++                    saw_row = True
++                    if missing_columns:
++                        scenarios.append(
++                            _rejected_scenario(
++                                bench_scenario,
++                                run_id,
++                                formal_exit_code,
++                                "scenario summary is missing required columns: "
++                                + ", ".join(missing_columns),
++                                row=row,
++                            )
++                        )
++                        continue
++                    empty_fields = [
++                        field
++                        for field in SCENARIO_SUMMARY_FIELDS[:-1]
++                        if not isinstance(row.get(field), str)
++                        or not row[field].strip()
++                        or "\x00" in row[field]
++                    ]
++                    if empty_fields:
++                        scenarios.append(
++                            _rejected_scenario(
++                                bench_scenario,
++                                run_id,
++                                formal_exit_code,
++                                "scenario summary has invalid required fields: "
++                                + ", ".join(empty_fields),
++                                row=row,
++                            )
++                        )
++                        continue
+                     try:
+-                        execution_passed = (
+-                            status_path.is_file()
+-                            and not status_path.is_symlink()
+-                            and status_path.read_text(encoding="utf-8").strip() == "OK"
++                        scenario_root = _candidate_path(row["result_root"], result_root)
++                        submission_dir = _candidate_path(
++                            row["submission_dir"], result_root
+                         )
+-                    except OSError:
++                        raw_result = _candidate_path(row["raw_result"], result_root)
++                        command_exit_code = _parse_exit_code(row.get("exit_code"))
++                        path_errors = []
++                        if not _path_is_contained(scenario_root, result_root):
++                            path_errors.append(
++                                "result_root escapes the benchmark result root"
++                            )
++                        if not _path_is_contained(raw_result, scenario_root):
++                            path_errors.append(
++                                "raw_result escapes the scenario result root"
++                            )
++                        if not _path_is_contained(submission_dir, scenario_root):
++                            path_errors.append("submission_dir escapes scenario root")
++
++                        status_path = submission_dir / "STATUS"
+                         execution_passed = False
+-                scenarios.append(
+-                    {
+-                        "scenario": row["scenario"],
+-                        "run_id": row["run_id"],
+-                        "status": "passed" if execution_passed else "failed",
+-                        "exit_code": command_exit_code,
+-                        "result_root": (
+-                            _relative_path(scenario_root, result_root)
+-                            if not path_errors
+-                            else "rejected"
+-                        ),
+-                        "raw_result": (
+-                            _relative_path(raw_result, result_root)
+-                            if not path_errors
+-                            else "rejected"
+-                        ),
+-                        "submission_dir": (
+-                            _relative_path(submission_dir, result_root)
+-                            if not path_errors
+-                            else "rejected"
+-                        ),
+-                        "path_errors": path_errors,
+-                        "_submission_path": submission_dir if not path_errors else None,
+-                    }
++                        if not path_errors and _raw_result_is_valid(raw_result):
++                            try:
++                                execution_passed = (
++                                    status_path.is_file()
++                                    and not status_path.is_symlink()
++                                    and status_path.read_text(encoding="utf-8").strip()
++                                    == "OK"
++                                )
++                            except (OSError, UnicodeDecodeError):
++                                execution_passed = False
++                        scenarios.append(
++                            {
++                                "scenario": row["scenario"],
++                                "run_id": row["run_id"],
++                                "status": ("passed" if execution_passed else "failed"),
++                                "exit_code": command_exit_code,
++                                "result_root": (
++                                    _relative_path(scenario_root, result_root)
++                                    if not path_errors
++                                    else "rejected"
++                                ),
++                                "raw_result": (
++                                    _relative_path(raw_result, result_root)
++                                    if not path_errors
++                                    else "rejected"
++                                ),
++                                "submission_dir": (
++                                    _relative_path(submission_dir, result_root)
++                                    if not path_errors
++                                    else "rejected"
++                                ),
++                                "path_errors": path_errors,
++                                "_submission_path": (
++                                    submission_dir if not path_errors else None
++                                ),
++                            }
++                        )
++                    except (OSError, RuntimeError, TypeError, ValueError):
++                        scenarios.append(
++                            _rejected_scenario(
++                                bench_scenario,
++                                run_id,
++                                formal_exit_code,
++                                "scenario summary row contains invalid paths",
++                                row=row,
++                            )
++                        )
++                if missing_columns and not saw_row:
++                    scenarios.append(
++                        _rejected_scenario(
++                            bench_scenario,
++                            run_id,
++                            formal_exit_code,
++                            "scenario summary is missing required columns: "
++                            + ", ".join(missing_columns),
++                        )
++                    )
++        except (OSError, UnicodeDecodeError, csv.Error):
++            scenarios.append(
++                _rejected_scenario(
++                    bench_scenario,
++                    run_id,
++                    formal_exit_code,
++                    "scenario summary is unreadable or malformed",
+                 )
++            )
+         return scenarios
+ 
+     submission_dir = result_root / "submissions" / run_id
+diff --git a/tests/ci/test_ascend_benchmark_diagnostics.py b/tests/ci/test_ascend_benchmark_diagnostics.py
+index bfce87c3d..3d091b3a4 100644
+--- a/tests/ci/test_ascend_benchmark_diagnostics.py
++++ b/tests/ci/test_ascend_benchmark_diagnostics.py
+@@ -5,6 +5,8 @@ from __future__ import annotations
+ import hashlib
+ import importlib.util
+ import json
++import subprocess
++import sys
+ from collections.abc import Sequence
+ from pathlib import Path
+ 
+@@ -158,6 +160,98 @@ def test_partial_run_preserves_failed_step_and_scenario_exit_codes(tmp_path: Pat
+     ]
+ 
+ 
++def test_scenario_summary_missing_columns_is_rejected(tmp_path: Path):
++    result_root = tmp_path / "results"
++    result_root.mkdir()
++    summary = result_root / "multi_scenario_results.tsv"
++    summary.write_text(
++        "scenario\trun_id\tresult_root\tsubmission_dir\texit_code\n"
++        "random-online\tnightly-random\t.\tsubmissions/nightly-random\t1\n",
++        encoding="utf-8",
++    )
++
++    payload = _build(
++        result_root,
++        summary,
++        [{"id": "formal-benchmark", "outcome": "failure", "exit_code": "1"}],
++    )
++
++    scenario = payload["scenario_summary"]["scenarios"][0]
++    assert payload["benchmark_execution_status"] == "failed"
++    assert scenario["scenario"] == "random-online"
++    assert scenario["raw_result"] == "rejected"
++    assert scenario["path_errors"] == [
++        "scenario summary is missing required columns: raw_result"
++    ]
++
++
++def test_invalid_scenario_row_is_rejected_without_losing_valid_rows(tmp_path: Path):
++    result_root = tmp_path / "results"
++    result_root.mkdir()
++    valid_row = _write_scenario(result_root, "random-online", 0, complete=True)
++    invalid_row = (
++        "sharegpt-online",
++        "nightly-sharegpt-online",
++        "",
++        "",
++        "",
++        "0",
++    )
++    summary = _write_scenario_summary(result_root, [valid_row, invalid_row])
++
++    payload = _build(
++        result_root,
++        summary,
++        [{"id": "formal-benchmark", "outcome": "failure", "exit_code": "87"}],
++    )
++
++    assert payload["benchmark_execution_status"] == "partial"
++    assert payload["scenario_summary"]["passed"] == 1
++    assert payload["scenario_summary"]["failed"] == 1
++    rejected = payload["scenario_summary"]["scenarios"][1]
++    assert rejected["scenario"] == "sharegpt-online"
++    assert rejected["exit_code"] == 0
++    assert rejected["result_root"] == "rejected"
++    assert rejected["path_errors"] == [
++        "scenario summary has invalid required fields: "
++        "result_root, raw_result, submission_dir"
++    ]
++
++
++def test_unreadable_scenario_summary_is_rejected(tmp_path: Path):
++    result_root = tmp_path / "results"
++    result_root.mkdir()
++    summary = result_root / "multi_scenario_results.tsv"
++    summary.write_bytes(b"scenario\trun_id\n\xff")
++    output = result_root / "nightly-diagnostics.json"
++
++    completed = subprocess.run(
++        [
++            sys.executable,
++            str(SCRIPT_PATH),
++            "--result-root",
++            str(result_root),
++            "--output",
++            str(output),
++            "--scenario-summary",
++            str(summary),
++            "--step-results-json",
++            '[{"id":"formal-benchmark","outcome":"failure","exit_code":"1"}]',
++        ],
++        check=False,
++        capture_output=True,
++        text=True,
++    )
++
++    assert completed.returncode == 0, completed.stderr
++    payload = json.loads(output.read_text(encoding="utf-8"))
++    scenario = payload["scenario_summary"]["scenarios"][0]
++    assert payload["benchmark_execution_status"] == "failed"
++    assert scenario["status"] == "failed"
++    assert scenario["result_root"] == "rejected"
++    assert scenario["path_errors"] == ["scenario summary is unreadable or malformed"]
++
++
+ def test_successful_execution_fails_data_quality_for_tampered_evidence(tmp_path: Path):
+     result_root = tmp_path / "results"
+     result_root.mkdir()
+-- 
+2.53.0.windows.3
+

@@ -1,0 +1,492 @@
+From 1d4a8706698d01d769d1420afdd82c8c9f1ed171 Mon Sep 17 00:00:00 2001
+From: Seas0 <season1277@outlook.com>
+Date: Fri, 19 Jun 2026 18:02:30 +0800
+Subject: [PATCH] feat: target activation sparsity projections
+
+---
+ scripts/bench_sparse_kernel_throughput.py | 12 ++++
+ scripts/eval_larosa_ppl_alignment.py      | 77 +++++++++++++++++------
+ scripts/eval_teal_ppl_alignment.py        | 63 +++++++++++++------
+ tests/sparsity/test_config.py             | 11 ++++
+ tests/sparsity/test_layers.py             | 49 ++++++++++++++-
+ vllm/sparsity/config.py                   | 22 +++++++
+ vllm/sparsity/layers.py                   | 12 ++++
+ 7 files changed, 208 insertions(+), 38 deletions(-)
+
+diff --git a/scripts/bench_sparse_kernel_throughput.py b/scripts/bench_sparse_kernel_throughput.py
+index 297a2685335..22eb10fc6d1 100644
+--- a/scripts/bench_sparse_kernel_throughput.py
++++ b/scripts/bench_sparse_kernel_throughput.py
+@@ -41,6 +41,16 @@ def parse_args() -> argparse.Namespace:
+     parser.add_argument("--enforce-eager", action="store_true")
+     parser.add_argument("--shutdown-timeout", type=int, default=60)
+     parser.add_argument("--vllm-prefill-sparsify", default="none")
++    parser.add_argument(
++        "--target-projection",
++        action="append",
++        choices=["self_attn.qkv", "self_attn.o", "mlp.gate_up", "mlp.down"],
++        default=None,
++        help=(
++            "Restrict activation sparsity to a projection. Can be repeated. "
++            "Useful for Ascend-friendly gate/up-only throughput checks."
++        ),
++    )
+     parser.add_argument(
+         "--sparse-gemv-dense-fallback-policy",
+         choices=["mask", "identity"],
+@@ -145,6 +155,8 @@ def build_sparse_config(args: argparse.Namespace) -> dict[str, Any]:
+                 "prefill_sparsify": args.vllm_prefill_sparsify,
+             }
+         )
++    if args.target_projection:
++        common["target_projections"] = args.target_projection
+     return common
+ 
+ 
+diff --git a/scripts/eval_larosa_ppl_alignment.py b/scripts/eval_larosa_ppl_alignment.py
+index 045c03a1d01..bde4bc69ccd 100644
+--- a/scripts/eval_larosa_ppl_alignment.py
++++ b/scripts/eval_larosa_ppl_alignment.py
+@@ -126,6 +126,16 @@ def parse_args() -> argparse.Namespace:
+             "activation_sparse_linear custom op."
+         ),
+     )
++    backends.add_argument(
++        "--target-projection",
++        action="append",
++        choices=["self_attn.qkv", "self_attn.o", "mlp.gate_up", "mlp.down"],
++        default=None,
++        help=(
++            "Restrict sparse HF hooks and vLLM activation sparsity to this "
++            "projection. Can be repeated."
++        ),
++    )
+     backends.add_argument(
+         "--vllm-allow-sparse-gemv-fallback",
+         action="store_true",
+@@ -262,15 +272,20 @@ class HFLarosaReference:
+         model: torch.nn.Module,
+         calibration_path: Path,
+         rotation_dtype: torch.dtype,
++        target_projections: list[str] | None,
+     ) -> None:
+         self.model = model
+         self.calibration_path = calibration_path
+         self.rotation_dtype = rotation_dtype
++        self.target_projections = target_projections
+         self.sparsity = 0.0
+         self.rotations: dict[int, torch.Tensor] = {}
+         self.handles: list[Any] = []
+         self._install_hooks()
+ 
++    def _targets(self, proj_name: str) -> bool:
++        return self.target_projections is None or proj_name in self.target_projections
++
+     def set_sparsity(self, sparsity: float) -> None:
+         self.sparsity = float(sparsity)
+ 
+@@ -285,29 +300,45 @@ class HFLarosaReference:
+     def _install_hooks(self) -> None:
+         layers = self.model.model.layers
+         for layer_idx, layer in enumerate(layers):
+-            q = torch.load(
+-                rotation_path(self.calibration_path, layer_idx),
+-                map_location="cpu",
+-                weights_only=True,
+-            )
+-            self.rotations[layer_idx] = q.to(dtype=self.rotation_dtype)
+-
+-            for module in (
+-                layer.self_attn.q_proj,
+-                layer.self_attn.k_proj,
+-                layer.self_attn.v_proj,
+-                layer.mlp.gate_proj,
+-                layer.mlp.up_proj,
+-            ):
++            if self._targets("self_attn.qkv") or self._targets("mlp.gate_up"):
++                q = torch.load(
++                    rotation_path(self.calibration_path, layer_idx),
++                    map_location="cpu",
++                    weights_only=True,
++                )
++                self.rotations[layer_idx] = q.to(dtype=self.rotation_dtype)
++
++            if self._targets("self_attn.qkv"):
++                for module in (
++                    layer.self_attn.q_proj,
++                    layer.self_attn.k_proj,
++                    layer.self_attn.v_proj,
++                ):
++                    self.handles.append(
++                        module.register_forward_pre_hook(
++                            self._make_h1_hook(layer_idx),
++                        )
++                    )
++
++            if self._targets("mlp.gate_up"):
++                for module in (layer.mlp.gate_proj, layer.mlp.up_proj):
++                    self.handles.append(
++                        module.register_forward_pre_hook(
++                            self._make_h1_hook(layer_idx),
++                        )
++                    )
++
++            if self._targets("self_attn.o"):
+                 self.handles.append(
+-                    module.register_forward_pre_hook(
+-                        self._make_h1_hook(layer_idx),
++                    layer.self_attn.o_proj.register_forward_pre_hook(
++                        self._make_h2_hook()
+                     )
+                 )
+-
+-            for module in (layer.self_attn.o_proj, layer.mlp.down_proj):
++            if self._targets("mlp.down"):
+                 self.handles.append(
+-                    module.register_forward_pre_hook(self._make_h2_hook())
++                    layer.mlp.down_proj.register_forward_pre_hook(
++                        self._make_h2_hook()
++                    )
+                 )
+ 
+     def _make_h1_hook(self, layer_idx: int):
+@@ -414,6 +445,11 @@ def run_hf_reference(
+     model_type: str,
+ ) -> BackendComparison:
+     if args.hf_reference_impl == "official_repo":
++        if args.target_projection:
++            raise ValueError(
++                "--target-projection is supported only with "
++                "--hf-reference-impl hooks."
++            )
+         model = build_official_larosa_model(args, model_type)
+         set_official_model_sparsity(model, 0.0)
+         reference_name = "official_repo"
+@@ -423,6 +459,7 @@ def run_hf_reference(
+             model,
+             args.calibration_path,
+             torch_dtype(args.rotation_dtype),
++            args.target_projection,
+         )
+         larosa_ref.set_sparsity(0.0)
+         reference_name = "hooks"
+@@ -485,6 +522,8 @@ def run_vllm_reference(
+         "strict_unsupported_check": True,
+         "use_sparse_gemv": args.vllm_use_sparse_gemv,
+     }
++    if args.target_projection:
++        sparsity_config["target_projections"] = args.target_projection
+     previous_require_kernel = os.environ.get("VLLM_SPARSE_GEMV_REQUIRE_KERNEL")
+     previous_sparse_marker_path = os.environ.get("VLLM_SPARSE_GEMV_MARKER_PATH")
+     previous_ascend_marker_path = os.environ.get(
+diff --git a/scripts/eval_teal_ppl_alignment.py b/scripts/eval_teal_ppl_alignment.py
+index f13b302cd0b..ca6793120c1 100644
+--- a/scripts/eval_teal_ppl_alignment.py
++++ b/scripts/eval_teal_ppl_alignment.py
+@@ -198,6 +198,16 @@ def parse_args() -> argparse.Namespace:
+             "sparsifies every token, none sparsifies decode tokens only."
+         ),
+     )
++    backends.add_argument(
++        "--target-projection",
++        action="append",
++        choices=["self_attn.qkv", "self_attn.o", "mlp.gate_up", "mlp.down"],
++        default=None,
++        help=(
++            "Restrict sparse HF hooks and vLLM activation sparsity to this "
++            "projection. Can be repeated."
++        ),
++    )
+     backends.add_argument(
+         "--vllm-use-sparse-gemv",
+         action=argparse.BooleanOptionalAction,
+@@ -481,13 +491,18 @@ class HFTealReference:
+         model: torch.nn.Module,
+         histogram_path: Path,
+         reference_mode: str,
++        target_projections: list[str] | None,
+     ) -> None:
+         self.model = model
+         self.histogram_path = histogram_path
+         self.reference_mode = reference_mode
++        self.target_projections = target_projections
+         self.masks: dict[str, TealMask] = {}
+         self._install_hooks()
+ 
++    def _targets(self, proj_name: str) -> bool:
++        return self.target_projections is None or proj_name in self.target_projections
++
+     def _register_mask(
+         self,
+         module: torch.nn.Module,
+@@ -520,28 +535,32 @@ class HFTealReference:
+             mlp_h1 = TealMask(self.reference_mode)
+             mlp_h2 = TealMask(self.reference_mode)
+ 
+-            for proj_name in ("q_proj", "k_proj", "v_proj"):
++            if self._targets("self_attn.qkv"):
++                for proj_name in ("q_proj", "k_proj", "v_proj"):
++                    self._register_mask(
++                        getattr(attn, proj_name),
++                        f"layers.{layer_idx}.self_attn.{proj_name}",
++                        attn_h1,
++                    )
++            if self._targets("self_attn.o"):
+                 self._register_mask(
+-                    getattr(attn, proj_name),
+-                    f"layers.{layer_idx}.self_attn.{proj_name}",
+-                    attn_h1,
++                    attn.o_proj,
++                    f"layers.{layer_idx}.self_attn.o_proj",
++                    attn_h2,
+                 )
+-            self._register_mask(
+-                attn.o_proj,
+-                f"layers.{layer_idx}.self_attn.o_proj",
+-                attn_h2,
+-            )
+-            for proj_name in ("gate_proj", "up_proj"):
++            if self._targets("mlp.gate_up"):
++                for proj_name in ("gate_proj", "up_proj"):
++                    self._register_mask(
++                        getattr(mlp, proj_name),
++                        f"layers.{layer_idx}.mlp.{proj_name}",
++                        mlp_h1,
++                    )
++            if self._targets("mlp.down"):
+                 self._register_mask(
+-                    getattr(mlp, proj_name),
+-                    f"layers.{layer_idx}.mlp.{proj_name}",
+-                    mlp_h1,
++                    mlp.down_proj,
++                    f"layers.{layer_idx}.mlp.down_proj",
++                    mlp_h2,
+                 )
+-            self._register_mask(
+-                mlp.down_proj,
+-                f"layers.{layer_idx}.mlp.down_proj",
+-                mlp_h2,
+-            )
+ 
+     def set_sparsity(self, sparsity: float) -> None:
+         layers = self.model.model.layers
+@@ -757,6 +776,11 @@ def run_hf_reference(
+     histogram_path: Path,
+ ) -> BackendComparison:
+     if args.hf_reference_impl == "official_repo":
++        if args.target_projection:
++            raise ValueError(
++                "--target-projection is supported only with "
++                "--hf-reference-impl hooks."
++            )
+         model = build_official_teal_model(args, histogram_path)
+         model.set_uniform_sparsity(0.0)
+     else:
+@@ -782,6 +806,7 @@ def run_hf_reference(
+             model=model,
+             histogram_path=histogram_path,
+             reference_mode=args.hf_reference_mode,
++            target_projections=args.target_projection,
+         )
+         teal_ref.set_sparsity(0.0)
+ 
+@@ -1089,6 +1114,8 @@ def run_vllm_reference(
+         "strict_unsupported_check": True,
+         "use_sparse_gemv": args.vllm_use_sparse_gemv,
+     }
++    if args.target_projection:
++        sparsity_config["target_projections"] = args.target_projection
+     previous_require_kernel = os.environ.get("VLLM_SPARSE_GEMV_REQUIRE_KERNEL")
+     previous_sparse_marker_path = os.environ.get("VLLM_SPARSE_GEMV_MARKER_PATH")
+     previous_ascend_marker_path = os.environ.get(
+diff --git a/tests/sparsity/test_config.py b/tests/sparsity/test_config.py
+index 90200c4d19f..e87c28a94fb 100644
+--- a/tests/sparsity/test_config.py
++++ b/tests/sparsity/test_config.py
+@@ -17,6 +17,7 @@ def test_activation_sparsity_config_defaults():
+     assert cfg.prefill_sparsify == "half"
+     assert cfg.strict_unsupported_check is True
+     assert cfg.use_sparse_gemv is False
++    assert cfg.target_projections is None
+ 
+ 
+ def test_activation_sparsity_config_hash():
+@@ -31,6 +32,13 @@ def test_activation_sparsity_config_hash():
+     h3 = cfg2.compute_hash()
+     assert h3 != h1
+ 
++    cfg3 = ActivationSparsityConfig(
++        enable=True,
++        uniform_sparsity=0.4,
++        target_projections=["mlp.gate_up"],
++    )
++    assert cfg3.compute_hash() != h1
++
+ 
+ def test_activation_sparsity_config_invalid_method():
+     # Pydantic dataclass with extra="forbid" should reject unknown fields
+@@ -39,3 +47,6 @@ def test_activation_sparsity_config_invalid_method():
+ 
+     with pytest.raises((ValueError, ValidationError)):
+         ActivationSparsityConfig(prefill_sparsify="last_token")
++
++    with pytest.raises((ValueError, ValidationError)):
++        ActivationSparsityConfig(target_projections=["mlp.gate"])
+diff --git a/tests/sparsity/test_layers.py b/tests/sparsity/test_layers.py
+index 5f04b42a46b..9c38d1f6e0a 100644
+--- a/tests/sparsity/test_layers.py
++++ b/tests/sparsity/test_layers.py
+@@ -8,7 +8,7 @@ import torch
+ 
+ from vllm.sparsity.config import ActivationSparsityConfig
+ from vllm.sparsity.distribution import LaRosaSparsifyFn
+-from vllm.sparsity.layers import build_sparsifier
++from vllm.sparsity.layers import build_sparsifier, merge_larosa_rotation_into_linear
+ 
+ 
+ def test_build_sparsifier_disabled():
+@@ -29,6 +29,16 @@ def test_build_sparsifier_missing_threshold():
+         build_sparsifier(cfg, layer_idx=0, proj_name="mlp.gate_up")
+ 
+ 
++def test_build_sparsifier_skips_non_target_projection_before_loading():
++    cfg = ActivationSparsityConfig(
++        enable=True,
++        calibration_path="/nonexistent/path",
++        target_projections=["mlp.gate_up"],
++    )
++
++    assert build_sparsifier(cfg, layer_idx=0, proj_name="mlp.down") is None
++
++
+ def test_build_sparsifier_success():
+     with tempfile.TemporaryDirectory() as tmpdir:
+         # Write a dummy threshold file
+@@ -138,3 +148,40 @@ def test_build_sparsifier_larosa_second_site_no_rotation_required():
+         assert sparsifier.expected_sparsity == 0.6
+         assert sparsifier.apply_all_tokens is False
+         assert sparsifier.prefill_sparsify == "half"
++
++
++def test_build_sparsifier_larosa_skips_non_target_projection():
++    with tempfile.TemporaryDirectory() as tmpdir:
++        cfg = ActivationSparsityConfig(
++            enable=True,
++            method="larosa",
++            calibration_path=tmpdir,
++            uniform_sparsity=0.5,
++            target_projections=["mlp.gate_up"],
++        )
++
++        assert build_sparsifier(cfg, layer_idx=2, proj_name="self_attn.qkv") is None
++
++
++def test_larosa_rotation_merge_skips_non_target_projection():
++    with tempfile.TemporaryDirectory() as tmpdir:
++        os.makedirs(os.path.join(tmpdir, "histograms", "layer-2", "self_attn"))
++        torch.save(
++            torch.eye(4),
++            os.path.join(tmpdir, "histograms", "layer-2", "self_attn", "D.pt"),
++        )
++        linear = torch.nn.Linear(4, 4, bias=False)
++        cfg = ActivationSparsityConfig(
++            enable=True,
++            method="larosa",
++            calibration_path=tmpdir,
++            target_projections=["mlp.gate_up"],
++        )
++
++        assert not merge_larosa_rotation_into_linear(
++            cfg,
++            layer_idx=2,
++            proj_name="self_attn.qkv",
++            linear_layer=linear,
++        )
++        assert not getattr(linear, "_larosa_sparse_weight_merged", False)
+diff --git a/vllm/sparsity/config.py b/vllm/sparsity/config.py
+index 300ce5874e0..efb7e1d5f43 100644
+--- a/vllm/sparsity/config.py
++++ b/vllm/sparsity/config.py
+@@ -8,6 +8,13 @@ from dataclasses import fields
+ from pydantic import ConfigDict
+ from pydantic.dataclasses import dataclass
+ 
++_SUPPORTED_TARGET_PROJECTIONS = {
++    "self_attn.qkv",
++    "self_attn.o",
++    "mlp.gate_up",
++    "mlp.down",
++}
++
+ 
+ @dataclass(config=ConfigDict(extra="forbid"))
+ class ActivationSparsityConfig:
+@@ -67,6 +74,11 @@ class ActivationSparsityConfig:
+     use_sparse_gemv: bool = False
+     """Enable backend sparse GEMV custom op. Experimental feature."""
+ 
++    # Optional projection filter
++    target_projections: list[str] | None = None
++    """If set, only apply activation sparsity to these projection names, e.g.
++    ``["mlp.gate_up"]`` for the Ascend-friendly fused-MLP path."""
++
+     def __post_init__(self) -> None:
+         if self.method not in {"teal", "larosa"}:
+             raise ValueError(
+@@ -78,6 +90,16 @@ class ActivationSparsityConfig:
+                 "prefill_sparsify must be one of 'half', 'all', or 'none', "
+                 f"got {self.prefill_sparsify!r}."
+             )
++        if self.target_projections is not None:
++            unknown = sorted(
++                set(self.target_projections) - _SUPPORTED_TARGET_PROJECTIONS
++            )
++            if unknown:
++                raise ValueError(
++                    "target_projections contains unsupported projection(s): "
++                    f"{unknown}. Supported projections are "
++                    f"{sorted(_SUPPORTED_TARGET_PROJECTIONS)}."
++                )
+ 
+     def compute_hash(self) -> str:
+         """Return a hash that uniquely identifies this sparsity config.
+diff --git a/vllm/sparsity/layers.py b/vllm/sparsity/layers.py
+index ac7b1e5ddb9..c518ec8ebc2 100644
+--- a/vllm/sparsity/layers.py
++++ b/vllm/sparsity/layers.py
+@@ -17,6 +17,14 @@ from vllm.sparsity.utils import load_threshold
+ logger = init_logger(__name__)
+ 
+ 
++def targets_projection(
++    sparsity_config: ActivationSparsityConfig,
++    proj_name: str,
++) -> bool:
++    target_projections = sparsity_config.target_projections
++    return target_projections is None or proj_name in target_projections
++
++
+ def build_sparsifier(
+     sparsity_config: ActivationSparsityConfig,
+     layer_idx: int,
+@@ -36,6 +44,8 @@ def build_sparsifier(
+     """
+     if not sparsity_config.enable:
+         return None
++    if not targets_projection(sparsity_config, proj_name):
++        return None
+ 
+     if not sparsity_config.calibration_path:
+         logger.warning_once(
+@@ -143,6 +153,8 @@ def merge_larosa_rotation_into_linear(
+         return False
+     if not sparsity_config.enable or not sparsity_config.calibration_path:
+         return False
++    if not targets_projection(sparsity_config, proj_name):
++        return False
+ 
+     rotation_path = find_rotation_matrix_path(
+         sparsity_config.calibration_path,
+-- 
+2.53.0.windows.3
+
