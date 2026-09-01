@@ -1,0 +1,161 @@
+From 8fa047cf89001b312e14f61ab3373f2b9bdb529d Mon Sep 17 00:00:00 2001
+From: Seas0 <season1277@outlook.com>
+Date: Thu, 7 May 2026 12:15:29 +0800
+Subject: [PATCH] [sparsity] Integrate ActivationSparsityConfig into VllmConfig
+ and CLI
+
+- Add activation_sparsity_config field to VllmConfig with compute_hash
+- Add --activation-sparsity-config CLI argument
+- Add auto-discovery from HF model directory in VllmConfig.__post_init__
+- Add strict unsupported-combination guard (TP/quant/LoRA)
+---
+ vllm/config/vllm.py      | 57 ++++++++++++++++++++++++++++++++++++++++
+ vllm/engine/arg_utils.py | 15 +++++++++++
+ 2 files changed, 72 insertions(+)
+
+diff --git a/vllm/config/vllm.py b/vllm/config/vllm.py
+index 75cff7dff06..e0ce283cef8 100644
+--- a/vllm/config/vllm.py
++++ b/vllm/config/vllm.py
+@@ -51,6 +51,9 @@ from .structured_outputs import StructuredOutputsConfig
+ from .utils import SupportsHash, config, replace
+ from .weight_transfer import WeightTransferConfig
+ 
++# Avoid circular import: ActivationSparsityConfig lives in vllm.sparsity.config
++from vllm.sparsity.config import ActivationSparsityConfig
++
+ if TYPE_CHECKING:
+     from transformers import PretrainedConfig
+ 
+@@ -374,6 +377,9 @@ class VllmConfig:
+     weight_transfer_config: WeightTransferConfig | None = None
+     """The configurations for weight transfer during RL training."""
+ 
++    activation_sparsity_config: ActivationSparsityConfig | None = None
++    """Activation sparsity configuration (TEAL / La RoSA)."""
++
+     shutdown_timeout: int = Field(default=0, ge=0)
+     """Shutdown grace period for in-flight requests. Shutdown will be delayed for
+     up to this amount of time to allow already-running requests to complete. Any
+@@ -481,6 +487,10 @@ class VllmConfig:
+             vllm_factors.append(additional_config_hash)
+         else:
+             vllm_factors.append("None")
++        if self.activation_sparsity_config:
++            vllm_factors.append(self.activation_sparsity_config.compute_hash())
++        else:
++            vllm_factors.append("None")
+         factors.append(vllm_factors)
+ 
+         hash_str = safe_hash(str(factors).encode(), usedforsecurity=False).hexdigest()[
+@@ -1588,6 +1598,53 @@ class VllmConfig:
+                 custom_ops.append("+quant_fp8")
+ 
+         self._verify_kv_transfer_compat()
++
++        # Auto-discover activation sparsity config from model directory
++        if (
++            self.activation_sparsity_config is None
++            and self.model_config is not None
++            and self.load_config is not None
++        ):
++            from vllm.model_executor.model_loader.weight_utils import (
++                get_activation_sparsity_config,
++            )
++
++            sparsity_json = get_activation_sparsity_config(
++                self.model_config, self.load_config
++            )
++            if sparsity_json:
++                self.activation_sparsity_config = ActivationSparsityConfig(
++                    **sparsity_json
++                )
++
++        # Activation sparsity unsupported-combination guard
++        if (
++            self.activation_sparsity_config is not None
++            and self.activation_sparsity_config.enable
++            and self.activation_sparsity_config.strict_unsupported_check
++        ):
++            if (
++                self.parallel_config is not None
++                and self.parallel_config.tensor_parallel_size > 1
++            ):
++                raise ValueError(
++                    "Activation sparsity (TEAL / La RoSA) does not yet support "
++                    "tensor parallelism (tp_size > 1). Please set tp_size=1 or "
++                    "disable strict_unsupported_check."
++                )
++            if self.quant_config is not None:
++                raise ValueError(
++                    "Activation sparsity (TEAL / La RoSA) does not yet support "
++                    "quantization. Please use an unquantized model or disable "
++                    "strict_unsupported_check."
++                )
++            if self.lora_config is not None:
++                raise ValueError(
++                    "Activation sparsity (TEAL / La RoSA) does not yet support "
++                    "LoRA. Please disable LoRA or disable "
++                    "strict_unsupported_check."
++                )
++
+         # Log the custom passes that are enabled
+         self.compilation_config.pass_config.log_enabled_passes()
+ 
+diff --git a/vllm/engine/arg_utils.py b/vllm/engine/arg_utils.py
+index af4b6fb073c..151b9a6495c 100644
+--- a/vllm/engine/arg_utils.py
++++ b/vllm/engine/arg_utils.py
+@@ -65,6 +65,7 @@ from vllm.config import (
+     WeightTransferConfig,
+     get_attr_docs,
+ )
++from vllm.sparsity.config import ActivationSparsityConfig
+ from vllm.config.cache import (
+     CacheDType,
+     KVOffloadingBackend,
+@@ -725,6 +726,11 @@ class EngineArgs:
+         "weight_transfer_config",
+     )
+ 
++    activation_sparsity_config: ActivationSparsityConfig | None = get_field(
++        VllmConfig,
++        "activation_sparsity_config",
++    )
++
+     fail_on_environ_validation: bool = False
+     gdn_prefill_backend: Literal["flashinfer", "triton", "cutedsl"] | None = None
+ 
+@@ -746,6 +752,10 @@ class EngineArgs:
+             self.weight_transfer_config = WeightTransferConfig(
+                 **self.weight_transfer_config
+             )
++        if isinstance(self.activation_sparsity_config, dict):
++            self.activation_sparsity_config = ActivationSparsityConfig(
++                **self.activation_sparsity_config
++            )
+         if isinstance(self.ir_op_priority, dict):
+             self.ir_op_priority = IrOpPriorityConfig(**self.ir_op_priority)
+ 
+@@ -1548,6 +1558,10 @@ class EngineArgs:
+         vllm_group.add_argument(
+             "--weight-transfer-config", **vllm_kwargs["weight_transfer_config"]
+         )
++        vllm_group.add_argument(
++            "--activation-sparsity-config",
++            **vllm_kwargs["activation_sparsity_config"],
++        )
+ 
+         # Other arguments
+         parser.add_argument(
+@@ -2356,6 +2370,7 @@ class EngineArgs:
+             optimization_level=self.optimization_level,
+             performance_mode=self.performance_mode,
+             weight_transfer_config=self.weight_transfer_config,
++            activation_sparsity_config=self.activation_sparsity_config,
+             shutdown_timeout=self.shutdown_timeout,
+         )
+ 
+-- 
+2.53.0.windows.3
+

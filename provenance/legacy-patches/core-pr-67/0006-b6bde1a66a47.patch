@@ -1,0 +1,414 @@
+From b6bde1a66a47e7d08277a4c9e88438b375db802d Mon Sep 17 00:00:00 2001
+From: Seas0 <season1277@outlook.com>
+Date: Thu, 7 May 2026 12:15:49 +0800
+Subject: [PATCH] [sparsity] Add unit tests for activation sparsity modules
+
+Add tests for:
+- ActivationSparsityConfig defaults, hash, validation
+- Distribution icdf and threshold computation
+- SparsifyFn zero/partial/high threshold behavior
+- RotationTransform round-trip
+- build_sparsifier with/without calibration data
+- load_threshold and compute_thresholds_from_histograms
+- VllmConfig hash integration
+- Llama injection point structural contract
+---
+ tests/sparsity/__init__.py               |  1 +
+ tests/sparsity/test_config.py            | 36 ++++++++++++
+ tests/sparsity/test_distribution.py      | 75 ++++++++++++++++++++++++
+ tests/sparsity/test_layers.py            | 50 ++++++++++++++++
+ tests/sparsity/test_llama_integration.py | 57 ++++++++++++++++++
+ tests/sparsity/test_rotation.py          | 30 ++++++++++
+ tests/sparsity/test_utils.py             | 48 +++++++++++++++
+ tests/sparsity/test_vllm_config.py       | 33 +++++++++++
+ 8 files changed, 330 insertions(+)
+ create mode 100644 tests/sparsity/__init__.py
+ create mode 100644 tests/sparsity/test_config.py
+ create mode 100644 tests/sparsity/test_distribution.py
+ create mode 100644 tests/sparsity/test_layers.py
+ create mode 100644 tests/sparsity/test_llama_integration.py
+ create mode 100644 tests/sparsity/test_rotation.py
+ create mode 100644 tests/sparsity/test_utils.py
+ create mode 100644 tests/sparsity/test_vllm_config.py
+
+diff --git a/tests/sparsity/__init__.py b/tests/sparsity/__init__.py
+new file mode 100644
+index 00000000000..9881313609a
+--- /dev/null
++++ b/tests/sparsity/__init__.py
+@@ -0,0 +1 @@
++# SPDX-License-Identifier: Apache-2.0
+diff --git a/tests/sparsity/test_config.py b/tests/sparsity/test_config.py
+new file mode 100644
+index 00000000000..63c073a25b3
+--- /dev/null
++++ b/tests/sparsity/test_config.py
+@@ -0,0 +1,36 @@
++# SPDX-License-Identifier: Apache-2.0
++
++import pytest
++
++from vllm.sparsity.config import ActivationSparsityConfig
++
++
++def test_activation_sparsity_config_defaults():
++    cfg = ActivationSparsityConfig()
++    assert cfg.enable is False
++    assert cfg.method == "teal"
++    assert cfg.uniform_sparsity == 0.0
++    assert cfg.calibration_path is None
++    assert cfg.decode_only is False
++    assert cfg.apply_all_tokens is True
++    assert cfg.strict_unsupported_check is True
++    assert cfg.use_sparse_gemv is False
++
++
++def test_activation_sparsity_config_hash():
++    cfg = ActivationSparsityConfig(enable=True, uniform_sparsity=0.4)
++    h1 = cfg.compute_hash()
++    h2 = cfg.compute_hash()
++    assert h1 == h2
++    assert isinstance(h1, str)
++    assert len(h1) == 64
++
++    cfg2 = ActivationSparsityConfig(enable=True, uniform_sparsity=0.5)
++    h3 = cfg2.compute_hash()
++    assert h3 != h1
++
++
++def test_activation_sparsity_config_invalid_method():
++    # Pydantic dataclass with extra="forbid" should reject unknown fields
++    with pytest.raises(TypeError):
++        ActivationSparsityConfig(unknown_field=True)
+diff --git a/tests/sparsity/test_distribution.py b/tests/sparsity/test_distribution.py
+new file mode 100644
+index 00000000000..86cd502f246
+--- /dev/null
++++ b/tests/sparsity/test_distribution.py
+@@ -0,0 +1,75 @@
++# SPDX-License-Identifier: Apache-2.0
++
++import pytest
++import torch
++
++from vllm.sparsity.distribution import Distribution, SparsifyFn
++
++
++def test_distribution_icdf():
++    # Simple histogram: 100 bins from -1 to 1, uniform distribution
++    bin_edges = torch.linspace(-1, 1, 101)
++    histogram = torch.ones(100)
++    dist = Distribution(histogram, bin_edges)
++
++    # median should be ~0
++    median = dist.icdf(0.5)
++    assert abs(median) < 0.02
++
++    # 0.75 quantile should be ~0.5
++    q75 = dist.icdf(0.75)
++    assert 0.4 < q75 < 0.6
++
++
++def test_distribution_icdf_teal_threshold():
++    """For 40% sparsity, threshold = icdf(0.5 + 0.4/2) = icdf(0.7)."""
++    bin_edges = torch.linspace(-1, 1, 101)
++    histogram = torch.ones(100)
++    dist = Distribution(histogram, bin_edges)
++
++    threshold = dist.icdf(0.5 + 0.4 / 2)
++    # For uniform on [-1, 1], icdf(0.7) = -1 + 2*0.7 = 0.4
++    assert 0.35 < threshold < 0.45
++
++
++def test_sparsify_fn_zero_sparsity():
++    """With threshold=0, sparsify_fn should be identity."""
++    threshold = torch.tensor(0.0)
++    sparsify = SparsifyFn(threshold, apply_all_tokens=True)
++
++    x = torch.randn(10, 20)
++    out = sparsify(x)
++    assert torch.allclose(out, x)
++
++
++def test_sparsify_fn_high_threshold():
++    """With a very high threshold, everything should be zeroed."""
++    threshold = torch.tensor(1e6)
++    sparsify = SparsifyFn(threshold, apply_all_tokens=True)
++
++    x = torch.randn(10, 20)
++    out = sparsify(x)
++    assert out.abs().max() == 0.0
++
++
++def test_sparsify_fn_partial_sparsity():
++    """Verify that roughly the expected fraction is zeroed."""
++    torch.manual_seed(42)
++    x = torch.randn(1000, 100)
++
++    # threshold = 0.5 -> keep |x| > 0.5
++    # For standard normal, P(|Z| > 0.5) ≈ 0.617
++    threshold = torch.tensor(0.5)
++    sparsify = SparsifyFn(threshold, apply_all_tokens=True)
++
++    out = sparsify(x)
++    sparsity = (out == 0).float().mean().item()
++    # Should be roughly 1 - 0.617 = 0.383
++    assert 0.30 < sparsity < 0.45
++
++
++def test_sparsify_fn_moved_threshold():
++    """Threshold buffer should follow module.to(device)."""
++    sparsify = SparsifyFn(torch.tensor(0.5))
++    sparsify.to("cpu")
++    assert sparsify.threshold.device.type == "cpu"
+diff --git a/tests/sparsity/test_layers.py b/tests/sparsity/test_layers.py
+new file mode 100644
+index 00000000000..4d1dd65f068
+--- /dev/null
++++ b/tests/sparsity/test_layers.py
+@@ -0,0 +1,50 @@
++# SPDX-License-Identifier: Apache-2.0
++
++import os
++import tempfile
++
++import pytest
++import torch
++
++from vllm.sparsity.config import ActivationSparsityConfig
++from vllm.sparsity.layers import build_sparsifier
++
++
++def test_build_sparsifier_disabled():
++    cfg = ActivationSparsityConfig(enable=False)
++    sparsifier = build_sparsifier(cfg, layer_idx=0, proj_name="mlp.gate_up")
++    assert sparsifier is None
++
++
++def test_build_sparsifier_no_calibration_path():
++    cfg = ActivationSparsityConfig(enable=True, calibration_path=None)
++    sparsifier = build_sparsifier(cfg, layer_idx=0, proj_name="mlp.gate_up")
++    assert sparsifier is None
++
++
++def test_build_sparsifier_missing_threshold():
++    cfg = ActivationSparsityConfig(
++        enable=True, calibration_path="/nonexistent/path"
++    )
++    with pytest.raises(FileNotFoundError):
++        build_sparsifier(cfg, layer_idx=0, proj_name="mlp.gate_up")
++
++
++def test_build_sparsifier_success():
++    with tempfile.TemporaryDirectory() as tmpdir:
++        # Write a dummy threshold file
++        threshold_path = os.path.join(
++            tmpdir, "layers.0.mlp.gate_up.threshold.pt"
++        )
++        torch.save(torch.tensor(0.5), threshold_path)
++
++        cfg = ActivationSparsityConfig(
++            enable=True, calibration_path=tmpdir, apply_all_tokens=True
++        )
++        sparsifier = build_sparsifier(cfg, layer_idx=0, proj_name="mlp.gate_up")
++
++        assert sparsifier is not None
++        x = torch.randn(4, 8)
++        out = sparsifier(x)
++        # With threshold 0.5, some values should be zeroed
++        assert (out == 0).any()
+diff --git a/tests/sparsity/test_llama_integration.py b/tests/sparsity/test_llama_integration.py
+new file mode 100644
+index 00000000000..bb4d0ee10fe
+--- /dev/null
++++ b/tests/sparsity/test_llama_integration.py
+@@ -0,0 +1,57 @@
++# SPDX-License-Identifier: Apache-2.0
++
++"""Lightweight structural tests for Llama sparsity injection.
++
++These tests do NOT require a model download or GPU; they only verify
++that the sparsifier modules are created and attached correctly.
++"""
++
++import os
++import tempfile
++
++import torch
++
++from vllm.sparsity.config import ActivationSparsityConfig
++
++
++def test_llama_mlp_sparsity_injection():
++    """LlamaMLP should create sparsify_gate_up and sparsify_down
++    when sparsity_config is provided with calibration data."""
++    # We can't import LlamaMLP directly here because it pulls in
++    # heavy vLLM internals (quantization, parallelism, etc.).
++    # Instead we verify the structural contract by inspecting the
++    # build_sparsifier helper.
++    from vllm.sparsity.layers import build_sparsifier
++
++    with tempfile.TemporaryDirectory() as tmpdir:
++        torch.save(torch.tensor(0.3), os.path.join(tmpdir, "layers.2.mlp.gate_up.threshold.pt"))
++        torch.save(torch.tensor(0.4), os.path.join(tmpdir, "layers.2.mlp.down.threshold.pt"))
++
++        cfg = ActivationSparsityConfig(enable=True, calibration_path=tmpdir)
++        gate_up = build_sparsifier(cfg, layer_idx=2, proj_name="mlp.gate_up")
++        down = build_sparsifier(cfg, layer_idx=2, proj_name="mlp.down")
++
++        assert gate_up is not None
++        assert down is not None
++
++        x = torch.randn(2, 8)
++        y_gate = gate_up(x)
++        y_down = down(x)
++        assert y_gate.shape == x.shape
++        assert y_down.shape == x.shape
++
++
++def test_llama_attention_sparsity_injection():
++    """LlamaAttention should create sparsify_qkv and sparsify_o."""
++    from vllm.sparsity.layers import build_sparsifier
++
++    with tempfile.TemporaryDirectory() as tmpdir:
++        torch.save(torch.tensor(0.3), os.path.join(tmpdir, "layers.0.self_attn.qkv.threshold.pt"))
++        torch.save(torch.tensor(0.4), os.path.join(tmpdir, "layers.0.self_attn.o.threshold.pt"))
++
++        cfg = ActivationSparsityConfig(enable=True, calibration_path=tmpdir)
++        qkv = build_sparsifier(cfg, layer_idx=0, proj_name="self_attn.qkv")
++        o_proj = build_sparsifier(cfg, layer_idx=0, proj_name="self_attn.o")
++
++        assert qkv is not None
++        assert o_proj is not None
+diff --git a/tests/sparsity/test_rotation.py b/tests/sparsity/test_rotation.py
+new file mode 100644
+index 00000000000..b8603e29489
+--- /dev/null
++++ b/tests/sparsity/test_rotation.py
+@@ -0,0 +1,30 @@
++# SPDX-License-Identifier: Apache-2.0
++
++import pytest
++import torch
++
++from vllm.sparsity.rotation import RotationTransform
++
++
++def test_rotation_transform_roundtrip():
++    """x @ D @ inv_D should recover x (up to dtype)."""
++    hidden = 16
++    d = torch.randn(hidden, hidden)
++    inv_d = torch.linalg.inv(d)
++
++    rot = RotationTransform(d_matrix=d, inv_d_matrix=inv_d)
++    x = torch.randn(2, hidden)
++
++    x_rot = rot(x)
++    x_recovered = rot.inverse(x_rot)
++    assert torch.allclose(x_recovered, x.to(x_recovered.dtype), atol=1e-4)
++
++
++def test_rotation_transform_shape():
++    d = torch.eye(8)
++    inv_d = torch.eye(8)
++    rot = RotationTransform(d_matrix=d, inv_d_matrix=inv_d)
++
++    x = torch.randn(3, 8)
++    out = rot(x)
++    assert out.shape == (3, 8)
+diff --git a/tests/sparsity/test_utils.py b/tests/sparsity/test_utils.py
+new file mode 100644
+index 00000000000..1d2f023078c
+--- /dev/null
++++ b/tests/sparsity/test_utils.py
+@@ -0,0 +1,48 @@
++# SPDX-License-Identifier: Apache-2.0
++
++import json
++import os
++import tempfile
++
++import pytest
++import torch
++
++from vllm.sparsity.utils import (
++    compute_thresholds_from_histograms,
++    load_threshold,
++)
++
++
++def test_load_threshold_success():
++    with tempfile.TemporaryDirectory() as tmpdir:
++        path = os.path.join(tmpdir, "layers.5.self_attn.qkv.threshold.pt")
++        torch.save(torch.tensor(0.42), path)
++
++        t = load_threshold(tmpdir, layer_idx=5, proj_name="self_attn.qkv")
++        assert isinstance(t, torch.Tensor)
++        assert t.item() == pytest.approx(0.42)
++
++
++def test_load_threshold_missing():
++    with tempfile.TemporaryDirectory() as tmpdir:
++        with pytest.raises(FileNotFoundError):
++            load_threshold(tmpdir, layer_idx=0, proj_name="mlp.down")
++
++
++def test_compute_thresholds_from_histograms():
++    with tempfile.TemporaryDirectory() as tmpdir:
++        bin_edges = torch.linspace(-1, 1, 101)
++        histograms = {
++            "layers.0.mlp.gate_up": torch.ones(100),
++            "layers.0.mlp.down": torch.ones(100),
++        }
++        path = os.path.join(tmpdir, "histograms.pt")
++        torch.save(
++            {"histograms": histograms, "bin_edges": bin_edges}, path
++        )
++
++        thresholds = compute_thresholds_from_histograms(path, sparsity=0.4)
++        assert "layers.0.mlp.gate_up" in thresholds
++        assert "layers.0.mlp.down" in thresholds
++        # For uniform [-1, 1], icdf(0.7) ≈ 0.4
++        assert 0.35 < thresholds["layers.0.mlp.gate_up"].item() < 0.45
+diff --git a/tests/sparsity/test_vllm_config.py b/tests/sparsity/test_vllm_config.py
+new file mode 100644
+index 00000000000..98ec6a72428
+--- /dev/null
++++ b/tests/sparsity/test_vllm_config.py
+@@ -0,0 +1,33 @@
++# SPDX-License-Identifier: Apache-2.0
++
++import pytest
++
++from vllm.sparsity.config import ActivationSparsityConfig
++
++
++class DummyConfig:
++    """Minimal stand-in for config objects that need compute_hash."""
++
++    def __init__(self, hash_val: str = "dummy"):
++        self._hash = hash_val
++
++    def compute_hash(self) -> str:
++        return self._hash
++
++
++def test_activation_sparsity_in_vllm_config_hash():
++    """ActivationSparsityConfig.compute_hash() must be deterministic
++    and sensitive to field changes."""
++    cfg1 = ActivationSparsityConfig(enable=True, uniform_sparsity=0.4)
++    cfg2 = ActivationSparsityConfig(enable=True, uniform_sparsity=0.5)
++
++    h1 = cfg1.compute_hash()
++    h2 = cfg2.compute_hash()
++    assert isinstance(h1, str)
++    assert h1 != h2
++
++
++def test_activation_sparsity_config_validation():
++    """Pydantic extra=forbid should reject unknown keys."""
++    with pytest.raises(TypeError):
++        ActivationSparsityConfig(unknown_field=123)
+-- 
+2.53.0.windows.3
+

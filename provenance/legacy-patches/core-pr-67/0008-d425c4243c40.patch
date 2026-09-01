@@ -1,0 +1,2118 @@
+From d425c4243c406955f80c4d8dfedb03efd3924062 Mon Sep 17 00:00:00 2001
+From: Seas0 <season1277@outlook.com>
+Date: Thu, 28 May 2026 14:02:21 +0800
+Subject: [PATCH] Add TEAL prefill half validation
+
+---
+ scripts/eval_teal_ppl_alignment.py  | 1016 +++++++++++++++++++++++++++
+ tests/sparsity/test_config.py       |    9 +-
+ tests/sparsity/test_distribution.py |   90 ++-
+ tests/sparsity/test_layers.py       |   35 +-
+ tests/sparsity/test_rotation.py     |   41 +-
+ tests/sparsity/test_vllm_config.py  |    3 +-
+ vllm/model_executor/models/llama.py |   18 +-
+ vllm/model_executor/models/qwen2.py |   18 +-
+ vllm/sparsity/__init__.py           |   18 +-
+ vllm/sparsity/config.py             |   46 +-
+ vllm/sparsity/distribution.py       |  232 +++++-
+ vllm/sparsity/layers.py             |   76 +-
+ vllm/sparsity/rotation.py           |  102 ++-
+ vllm/sparsity/utils.py              |    2 +-
+ 14 files changed, 1571 insertions(+), 135 deletions(-)
+ create mode 100644 scripts/eval_teal_ppl_alignment.py
+
+diff --git a/scripts/eval_teal_ppl_alignment.py b/scripts/eval_teal_ppl_alignment.py
+new file mode 100644
+index 00000000000..51ed19521e3
+--- /dev/null
++++ b/scripts/eval_teal_ppl_alignment.py
+@@ -0,0 +1,1016 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Compare TEAL PPL deltas between vLLM and an HF reference path.
++
++The default HF reference mirrors the public FasterDecoding/TEAL implementation:
++thresholds are computed with ``icdf(0.5 + sparsity / 2)`` from per-layer
++histograms, then applied before q/k/v/o and gate/up/down projections. Passing
++``--hf-reference-impl official_repo`` instead loads the model class from a local
++FasterDecoding/TEAL checkout.
++
++Three HF reference modes are provided:
++* ``official_half``: match TEAL's HF SparsifyFn default, which sparsifies only
++  the last half of a prefill sequence.
++* ``all_tokens``: sparsify every token, matching the legacy vLLM Phase 0 path.
++* ``decode_only``: leave prefill dense and sparsify single-token decode only.
++
++The vLLM sparse path defaults to ``prefill_sparsify="half"`` so its PPL delta
++can be checked against ``official_half`` directly.
++"""
++
++from __future__ import annotations
++
++import argparse
++import gc
++import json
++import math
++import sys
++from collections.abc import Iterable
++from dataclasses import asdict, dataclass
++from pathlib import Path
++from typing import Any
++
++import torch
++from tqdm import tqdm
++
++DEFAULT_MODEL = "meta-llama/Llama-2-7b-hf"
++DEFAULT_ARTIFACT_ROOT = Path(".cache/teal_validation/llama2_7b_s0.50")
++SUPPORTED_PROJECTIONS = (
++    "self_attn.qkv",
++    "self_attn.o",
++    "mlp.gate_up",
++    "mlp.down",
++)
++
++
++@dataclass
++class PPLStats:
++    nll: float
++    ppl: float
++    token_weighted_nll: float
++    token_weighted_ppl: float
++    windows: int
++    tokens: int
++
++
++@dataclass
++class BackendComparison:
++    backend: str
++    dense: PPLStats
++    sparse: PPLStats
++
++    @property
++    def delta_nll(self) -> float:
++        return self.sparse.nll - self.dense.nll
++
++    @property
++    def delta_ppl(self) -> float:
++        return self.sparse.ppl - self.dense.ppl
++
++    @property
++    def ppl_ratio(self) -> float:
++        return self.sparse.ppl / self.dense.ppl
++
++
++def parse_args() -> argparse.Namespace:
++    parser = argparse.ArgumentParser(
++        description=(
++            "Evaluate TEAL dense/sparse PPL deltas for vLLM and an "
++            "HF reference implementation."
++        )
++    )
++    parser.add_argument("--model", default=DEFAULT_MODEL)
++    parser.add_argument("--sparsity", type=float, default=0.5)
++    parser.add_argument(
++        "--artifact-root",
++        type=Path,
++        default=DEFAULT_ARTIFACT_ROOT,
++        help="Directory containing manifest/config plus official_histograms.",
++    )
++    parser.add_argument(
++        "--hf-histogram-path",
++        type=Path,
++        default=None,
++        help=(
++            "Official TEAL histogram root, e.g. "
++            "models/Llama-2-7B/histograms. Defaults to "
++            "<artifact-root>/official_histograms."
++        ),
++    )
++    parser.add_argument(
++        "--vllm-calibration-path",
++        type=Path,
++        default=None,
++        help=(
++            "vLLM threshold root. Defaults to <artifact-root>/thresholds or "
++            "activation_sparsity_config.json calibration_path."
++        ),
++    )
++    parser.add_argument(
++        "--teal-repo-path",
++        type=Path,
++        default=None,
++        help=(
++            "Optional FasterDecoding/TEAL checkout. Used only for a threshold "
++            "spot-check against the official Distribution class."
++        ),
++    )
++
++    dataset = parser.add_argument_group("dataset")
++    dataset.add_argument(
++        "--dataset-name",
++        default=None,
++        help=(
++            "HF dataset name. For the official paper-style smoke, use tatsu-lab/alpaca."
++        ),
++    )
++    dataset.add_argument("--dataset-subset", default=None)
++    dataset.add_argument("--dataset-split", default="train")
++    dataset.add_argument("--dataset-text-field", default="text")
++    dataset.add_argument("--dataset-size", type=int, default=250)
++    dataset.add_argument(
++        "--text-file",
++        type=Path,
++        default=None,
++        help="Plain-text file; paragraphs are split on blank lines.",
++    )
++    dataset.add_argument(
++        "--inline-text",
++        action="append",
++        default=None,
++        help="Inline sample text. Can be passed multiple times.",
++    )
++
++    ppl = parser.add_argument_group("ppl windowing")
++    ppl.add_argument("--context-size", type=int, default=2048)
++    ppl.add_argument("--window-size", type=int, default=512)
++    ppl.add_argument(
++        "--max-windows",
++        type=int,
++        default=None,
++        help="Limit windows for smoke tests. Full eval should leave this unset.",
++    )
++
++    backends = parser.add_argument_group("backends")
++    backends.add_argument(
++        "--backend",
++        choices=["both", "hf", "vllm"],
++        default="both",
++        help="Which backend(s) to evaluate.",
++    )
++    backends.add_argument(
++        "--hf-reference-mode",
++        choices=["official_half", "all_tokens", "decode_only"],
++        default="official_half",
++        help=(
++            "official_half matches FasterDecoding/TEAL HF prefill behavior; "
++            "all_tokens matches the legacy all-token sparsity path."
++        ),
++    )
++    backends.add_argument(
++        "--hf-reference-impl",
++        choices=["hooks", "official_repo"],
++        default="hooks",
++        help=(
++            "hooks uses local forward pre-hooks that mirror TEAL; "
++            "official_repo imports the FasterDecoding/TEAL sparse model class "
++            "from --teal-repo-path."
++        ),
++    )
++    backends.add_argument(
++        "--vllm-prefill-sparsify",
++        choices=["half", "all", "none"],
++        default="half",
++        help=(
++            "vLLM prefill policy: half matches FasterDecoding/TEAL, all "
++            "sparsifies every token, none sparsifies decode tokens only."
++        ),
++    )
++    backends.add_argument(
++        "--hf-attn-implementation",
++        default="sdpa",
++        help="HF attention implementation for the local reference model.",
++    )
++    backends.add_argument("--device", default="cuda")
++    backends.add_argument(
++        "--dtype",
++        choices=["float16", "bfloat16", "float32"],
++        default="float16",
++    )
++    backends.add_argument(
++        "--vllm-gpu-memory-utilization",
++        type=float,
++        default=0.9,
++    )
++    backends.add_argument(
++        "--vllm-max-model-len",
++        type=int,
++        default=None,
++        help="Defaults to context_size + window_size + 1.",
++    )
++    backends.add_argument(
++        "--vllm-enforce-eager",
++        action=argparse.BooleanOptionalAction,
++        default=True,
++    )
++    backends.add_argument(
++        "--vllm-shutdown-timeout",
++        type=int,
++        default=5,
++    )
++
++    compare = parser.add_argument_group("comparison")
++    compare.add_argument("--delta-nll-atol", type=float, default=0.02)
++    compare.add_argument("--delta-nll-rtol", type=float, default=0.05)
++    compare.add_argument(
++        "--fail-on-mismatch",
++        action="store_true",
++        help="Exit non-zero when vLLM delta NLL is outside tolerance.",
++    )
++    compare.add_argument(
++        "--json-output",
++        type=Path,
++        default=None,
++        help="Optional path for a machine-readable result JSON.",
++    )
++    return parser.parse_args()
++
++
++def torch_dtype(name: str) -> torch.dtype:
++    return {
++        "float16": torch.float16,
++        "bfloat16": torch.bfloat16,
++        "float32": torch.float32,
++    }[name]
++
++
++def load_tokenizer(model: str):
++    from transformers import AutoTokenizer
++
++    tokenizer = AutoTokenizer.from_pretrained(
++        model,
++        use_fast=True,
++        trust_remote_code=True,
++    )
++    if tokenizer.pad_token_id is None:
++        tokenizer.pad_token_id = (
++            tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0
++        )
++    return tokenizer
++
++
++def load_texts(args: argparse.Namespace) -> list[str]:
++    if args.inline_text:
++        return args.inline_text
++
++    if args.text_file:
++        text = args.text_file.read_text()
++        paragraphs = [p.strip() for p in text.split("\n\n")]
++        return [p for p in paragraphs if p]
++
++    if args.dataset_name:
++        try:
++            from datasets import load_dataset
++        except ImportError as exc:
++            raise RuntimeError(
++                "datasets is required for --dataset-name. Install it with "
++                "`uv pip install --python .venv/bin/python datasets`."
++            ) from exc
++        dataset = load_dataset(
++            args.dataset_name,
++            args.dataset_subset,
++            split=args.dataset_split,
++        )
++        if args.dataset_size is not None:
++            dataset = dataset.select(range(min(args.dataset_size, len(dataset))))
++        return [str(sample[args.dataset_text_field]) for sample in dataset]
++
++    return [
++        "TEAL applies magnitude-based activation sparsity to transformer "
++        "hidden states without retraining.",
++        "Perplexity alignment is checked by scoring the same target tokens "
++        "under dense and sparse execution paths.",
++        "The vLLM path should match the HF reference once threshold mapping "
++        "and prefill sparsification semantics are the same.",
++    ]
++
++
++def build_eval_ids(
++    tokenizer: Any,
++    texts: Iterable[str],
++    window_size: int,
++) -> list[int]:
++    text = "\n\n".join(texts)
++    encodings = tokenizer(text, return_tensors="pt")
++    token_ids = encodings.input_ids[0].tolist()
++    seq_len = len(token_ids) - (len(token_ids) % window_size)
++    if seq_len < 2:
++        raise ValueError(
++            f"Need at least 2 eval tokens after window truncation, got {seq_len}."
++        )
++    return token_ids[:seq_len]
++
++
++def iter_windows(
++    token_ids: list[int],
++    context_size: int,
++    window_size: int,
++    max_windows: int | None = None,
++) -> list[list[int]]:
++    max_length = context_size + window_size
++    windows: list[list[int]] = []
++    for begin_loc in range(0, len(token_ids), window_size):
++        end_loc = begin_loc + max_length
++        window = token_ids[begin_loc:end_loc]
++        if len(window) >= 2:
++            windows.append(window)
++        if max_windows is not None and len(windows) >= max_windows:
++            break
++        if end_loc >= len(token_ids):
++            break
++    if not windows:
++        raise ValueError("No PPL windows were produced.")
++    return windows
++
++
++def target_start(window_len: int, window_size: int) -> int:
++    return max(1, window_len - window_size)
++
++
++def official_icdf_from_histogram(
++    histogram_path: Path,
++    hidden_type: str,
++    sparsity: float,
++) -> torch.Tensor:
++    histogram = torch.load(histogram_path, map_location="cpu", weights_only=False)
++    centers = histogram[f"{hidden_type}_centers"].float()
++    counts = histogram[hidden_type].float()
++    total_count = counts.sum()
++    cumulative_counts = torch.cumsum(counts, dim=0)
++    target_count = (0.5 + sparsity / 2.0) * total_count
++    idx = torch.searchsorted(cumulative_counts, target_count)
++
++    if idx == 0:
++        value = centers[0]
++    elif idx == len(centers):
++        value = centers[-1]
++    else:
++        lower_count = cumulative_counts[idx - 1]
++        upper_count = cumulative_counts[idx]
++        lower_value = centers[idx - 1]
++        upper_value = centers[idx]
++        denom = upper_count - lower_count
++        if denom.abs() < 1e-12:
++            value = lower_value
++        else:
++            fraction = (target_count - lower_count) / denom
++            value = lower_value + fraction * (upper_value - lower_value)
++    return value.detach().cpu().to(torch.float32).reshape(())
++
++
++class TealMask(torch.nn.Module):
++    def __init__(self, reference_mode: str) -> None:
++        super().__init__()
++        self.reference_mode = reference_mode
++        self.register_buffer("threshold", torch.tensor(0.0, dtype=torch.float32))
++
++    def set_threshold(self, threshold: torch.Tensor | float) -> None:
++        if not isinstance(threshold, torch.Tensor):
++            threshold = torch.tensor(threshold, dtype=torch.float32)
++        self.threshold = threshold.detach().cpu().to(torch.float32).reshape(())
++
++    def _apply_mask(self, x: torch.Tensor) -> torch.Tensor:
++        threshold = self.threshold.to(device=x.device, dtype=x.dtype)
++        return x.abs().gt(threshold) * x
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        if self.reference_mode == "all_tokens":
++            return self._apply_mask(x)
++
++        if x.dim() < 3:
++            if self.reference_mode == "decode_only":
++                return self._apply_mask(x) if x.size(0) == 1 else x
++            half_seq_len = x.size(0) // 2
++            return torch.cat((x[:-half_seq_len], self._apply_mask(x[-half_seq_len:])))
++
++        seq_len = x.size(1)
++        if self.reference_mode == "decode_only":
++            return self._apply_mask(x) if seq_len == 1 else x
++
++        if seq_len > 1:
++            half_seq_len = seq_len // 2
++            return torch.cat(
++                (x[:, :-half_seq_len, :], self._apply_mask(x[:, -half_seq_len:, :])),
++                dim=1,
++            )
++        return self._apply_mask(x)
++
++
++class HFTealReference:
++    def __init__(
++        self,
++        model: torch.nn.Module,
++        histogram_path: Path,
++        reference_mode: str,
++    ) -> None:
++        self.model = model
++        self.histogram_path = histogram_path
++        self.reference_mode = reference_mode
++        self.masks: dict[str, TealMask] = {}
++        self._install_hooks()
++
++    def _register_mask(
++        self,
++        module: torch.nn.Module,
++        name: str,
++        mask: TealMask,
++    ) -> None:
++        self.masks[name] = mask
++
++        def hook(_module: torch.nn.Module, inputs: tuple[Any, ...]) -> tuple[Any, ...]:
++            if not inputs:
++                return inputs
++            return (mask(inputs[0]), *inputs[1:])
++
++        handle = module.register_forward_pre_hook(hook)
++        hooks = getattr(self.model, "_teal_alignment_hooks", [])
++        hooks.append(handle)
++        self.model._teal_alignment_hooks = hooks
++
++    def _install_hooks(self) -> None:
++        layers = getattr(getattr(self.model, "model", None), "layers", None)
++        if layers is None:
++            raise ValueError("HF reference currently expects model.model.layers.")
++
++        for layer_idx, layer in enumerate(layers):
++            attn = layer.self_attn
++            mlp = layer.mlp
++
++            attn_h1 = TealMask(self.reference_mode)
++            attn_h2 = TealMask(self.reference_mode)
++            mlp_h1 = TealMask(self.reference_mode)
++            mlp_h2 = TealMask(self.reference_mode)
++
++            for proj_name in ("q_proj", "k_proj", "v_proj"):
++                self._register_mask(
++                    getattr(attn, proj_name),
++                    f"layers.{layer_idx}.self_attn.{proj_name}",
++                    attn_h1,
++                )
++            self._register_mask(
++                attn.o_proj,
++                f"layers.{layer_idx}.self_attn.o_proj",
++                attn_h2,
++            )
++            for proj_name in ("gate_proj", "up_proj"):
++                self._register_mask(
++                    getattr(mlp, proj_name),
++                    f"layers.{layer_idx}.mlp.{proj_name}",
++                    mlp_h1,
++                )
++            self._register_mask(
++                mlp.down_proj,
++                f"layers.{layer_idx}.mlp.down_proj",
++                mlp_h2,
++            )
++
++    def set_sparsity(self, sparsity: float) -> None:
++        layers = self.model.model.layers
++        for layer_idx, _layer in enumerate(layers):
++            mlp_path = self.histogram_path / f"layer-{layer_idx}" / "mlp"
++            attn_path = self.histogram_path / f"layer-{layer_idx}" / "self_attn"
++            if sparsity == 0:
++                mlp_h1 = mlp_h2 = attn_h1 = attn_h2 = torch.tensor(0.0)
++            else:
++                mlp_h1 = official_icdf_from_histogram(
++                    mlp_path / "histograms.pt", "h1", sparsity
++                )
++                mlp_h2 = official_icdf_from_histogram(
++                    mlp_path / "histograms.pt", "h2", sparsity
++                )
++                attn_h1 = official_icdf_from_histogram(
++                    attn_path / "histograms.pt", "h1", sparsity
++                )
++                attn_h2 = official_icdf_from_histogram(
++                    attn_path / "histograms.pt", "h2", sparsity
++                )
++
++            for name, mask in self.masks.items():
++                prefix = f"layers.{layer_idx}."
++                if not name.startswith(prefix):
++                    continue
++                if (
++                    ".self_attn.q_proj" in name
++                    or ".self_attn.k_proj" in name
++                    or ".self_attn.v_proj" in name
++                ):
++                    mask.set_threshold(attn_h1)
++                elif ".self_attn.o_proj" in name:
++                    mask.set_threshold(attn_h2)
++                elif ".mlp.gate_proj" in name or ".mlp.up_proj" in name:
++                    mask.set_threshold(mlp_h1)
++                elif ".mlp.down_proj" in name:
++                    mask.set_threshold(mlp_h2)
++
++
++def build_official_teal_model(
++    args: argparse.Namespace,
++    histogram_path: Path,
++) -> torch.nn.Module:
++    if args.teal_repo_path is None:
++        raise ValueError("--hf-reference-impl official_repo requires --teal-repo-path.")
++    if args.hf_reference_mode == "all_tokens":
++        raise ValueError(
++            "The official TEAL HF backend supports half-prefill "
++            "(apply_prefill=True) and decode-only (apply_prefill=False), "
++            "but not the synthetic all_tokens reference mode."
++        )
++
++    teal_repo_path = args.teal_repo_path.resolve()
++    sys.path.insert(0, str(teal_repo_path))
++    try:
++        from teal.model import (  # type: ignore[import-not-found]
++            LlamaSparseConfig,
++            LlamaSparseForCausalLM,
++            MistralSparseConfig,
++            MistralSparseForCausalLM,
++        )
++    finally:
++        sys.path.pop(0)
++
++    from transformers import AutoConfig
++
++    base_config = AutoConfig.from_pretrained(args.model, trust_remote_code=True)
++    if base_config.model_type == "llama":
++        sparse_config = LlamaSparseConfig.from_dict(base_config.to_dict())
++        model_cls = LlamaSparseForCausalLM
++    elif base_config.model_type == "mistral":
++        sparse_config = MistralSparseConfig.from_dict(base_config.to_dict())
++        model_cls = MistralSparseForCausalLM
++    else:
++        raise ValueError(
++            "Official TEAL HF backend currently supports llama and mistral "
++            f"configs, got model_type={base_config.model_type!r}."
++        )
++
++    model = model_cls.from_pretrained(
++        args.model,
++        config=sparse_config,
++        histogram_path=str(histogram_path),
++        uniform_sparsity=0.0,
++        apply_prefill=args.hf_reference_mode == "official_half",
++        torch_dtype=torch_dtype(args.dtype),
++        trust_remote_code=True,
++    )
++    patch_official_teal_transformers_compat(model)
++    model.to(args.device)
++    return model
++
++
++def patch_official_teal_transformers_compat(model: torch.nn.Module) -> None:
++    """Fill attributes expected by the TEAL monkeypatch on newer HF Llama."""
++    layers = getattr(getattr(model, "model", None), "layers", None)
++    config = getattr(model, "config", None)
++    if layers is None or config is None:
++        return
++
++    rotary_emb = getattr(getattr(model, "model", None), "rotary_emb", None)
++    for layer in layers:
++        attn = getattr(layer, "self_attn", None)
++        if attn is None:
++            continue
++        if not hasattr(attn, "num_heads") and hasattr(config, "num_attention_heads"):
++            attn.num_heads = config.num_attention_heads
++        if not hasattr(attn, "num_key_value_heads") and hasattr(
++            config, "num_key_value_heads"
++        ):
++            attn.num_key_value_heads = config.num_key_value_heads
++        if not hasattr(attn, "hidden_size") and hasattr(config, "hidden_size"):
++            attn.hidden_size = config.hidden_size
++        if not hasattr(attn, "rotary_emb") and rotary_emb is not None:
++            attn.rotary_emb = rotary_emb
++
++
++def validate_artifacts(
++    histogram_path: Path,
++    calibration_path: Path,
++    num_layers: int,
++) -> None:
++    missing: list[str] = []
++    for layer_idx in range(num_layers):
++        for rel in (
++            f"layer-{layer_idx}/mlp/histograms.pt",
++            f"layer-{layer_idx}/self_attn/histograms.pt",
++        ):
++            if not (histogram_path / rel).exists():
++                missing.append(str(histogram_path / rel))
++        for proj in SUPPORTED_PROJECTIONS:
++            filename = f"layers.{layer_idx}.{proj}.threshold.pt"
++            if not (calibration_path / filename).exists():
++                missing.append(str(calibration_path / filename))
++    if missing:
++        raise FileNotFoundError(
++            "Missing TEAL calibration artifacts:\n" + "\n".join(missing[:20])
++        )
++
++
++def spot_check_official_distribution(
++    teal_repo_path: Path | None,
++    histogram_path: Path,
++    sparsity: float,
++) -> None:
++    if teal_repo_path is None:
++        return
++
++    sys.path.insert(0, str(teal_repo_path.resolve()))
++    try:
++        from utils.utils import Distribution
++    finally:
++        sys.path.pop(0)
++
++    for layer_idx, part, hidden_type in (
++        (0, "mlp", "h1"),
++        (0, "self_attn", "h2"),
++    ):
++        path = histogram_path / f"layer-{layer_idx}" / part
++        official = Distribution(str(path), hidden_type)
++        official_value = float(official.icdf(0.5 + sparsity / 2.0))
++        local_value = float(
++            official_icdf_from_histogram(path / "histograms.pt", hidden_type, sparsity)
++        )
++        if not math.isclose(official_value, local_value, rel_tol=1e-6, abs_tol=1e-6):
++            raise AssertionError(
++                "Threshold computation mismatch against official TEAL "
++                f"Distribution for {path} {hidden_type}: "
++                f"{local_value} != {official_value}"
++            )
++
++
++def score_hf_windows(
++    model: torch.nn.Module,
++    windows: list[list[int]],
++    window_size: int,
++    device: str,
++    desc: str,
++) -> PPLStats:
++    model.eval()
++    nlls: list[float] = []
++    weighted_nll_sum = 0.0
++    token_count = 0
++    for window in tqdm(windows, desc=desc):
++        input_ids = torch.tensor(window, dtype=torch.long, device=device).unsqueeze(0)
++        labels = input_ids.clone()
++        labels[:, :-window_size] = -100
++        start = target_start(input_ids.size(1), window_size)
++        count = input_ids.size(1) - start
++        with torch.no_grad():
++            loss = model(input_ids, labels=labels).loss.float()
++        nll = float(loss.item())
++        nlls.append(nll)
++        weighted_nll_sum += nll * count
++        token_count += count
++
++    mean_nll = sum(nlls) / len(nlls)
++    token_weighted_nll = weighted_nll_sum / token_count
++    return PPLStats(
++        nll=mean_nll,
++        ppl=math.exp(mean_nll),
++        token_weighted_nll=token_weighted_nll,
++        token_weighted_ppl=math.exp(token_weighted_nll),
++        windows=len(nlls),
++        tokens=token_count,
++    )
++
++
++def run_hf_reference(
++    args: argparse.Namespace,
++    windows: list[list[int]],
++    histogram_path: Path,
++) -> BackendComparison:
++    if args.hf_reference_impl == "official_repo":
++        model = build_official_teal_model(args, histogram_path)
++        model.set_uniform_sparsity(0.0)
++    else:
++        from transformers import AutoModelForCausalLM
++
++        dtype = torch_dtype(args.dtype)
++        model = AutoModelForCausalLM.from_pretrained(
++            args.model,
++            torch_dtype=dtype,
++            trust_remote_code=True,
++            attn_implementation=args.hf_attn_implementation,
++            low_cpu_mem_usage=True,
++        )
++        model.to(args.device)
++
++        model_vocab_size = model.get_input_embeddings().weight.size(0)
++        tokenizer = load_tokenizer(args.model)
++        tokenizer_vocab_size = len(tokenizer)
++        if model_vocab_size != tokenizer_vocab_size:
++            model.resize_token_embeddings(tokenizer_vocab_size)
++
++        teal_ref = HFTealReference(
++            model=model,
++            histogram_path=histogram_path,
++            reference_mode=args.hf_reference_mode,
++        )
++        teal_ref.set_sparsity(0.0)
++
++    dense = score_hf_windows(
++        model,
++        windows,
++        args.window_size,
++        args.device,
++        desc=f"HF dense ({args.hf_reference_mode})",
++    )
++    if args.hf_reference_impl == "official_repo":
++        model.set_uniform_sparsity(args.sparsity)
++    else:
++        teal_ref.set_sparsity(args.sparsity)
++    sparse = score_hf_windows(
++        model,
++        windows,
++        args.window_size,
++        args.device,
++        desc=f"HF sparse s={args.sparsity}",
++    )
++
++    del model
++    gc.collect()
++    if torch.cuda.is_available():
++        torch.cuda.empty_cache()
++    return BackendComparison(
++        backend=f"hf_reference:{args.hf_reference_impl}:{args.hf_reference_mode}",
++        dense=dense,
++        sparse=sparse,
++    )
++
++
++def prompt_logprob(logprobs: Any, position: int, token_id: int) -> float:
++    entry = logprobs[position]
++    if entry is None:
++        raise ValueError(f"No prompt logprob at position {position}.")
++    item = entry.get(token_id)
++    if item is None:
++        raise KeyError(
++            f"Token id {token_id} missing from prompt_logprobs at {position}."
++        )
++    return float(item.logprob)
++
++
++def score_vllm_windows(
++    llm: Any,
++    windows: list[list[int]],
++    window_size: int,
++    desc: str,
++) -> PPLStats:
++    from vllm import SamplingParams
++
++    sampling_params = SamplingParams(
++        temperature=0.0,
++        max_tokens=1,
++        prompt_logprobs=0,
++        detokenize=False,
++    )
++    nlls: list[float] = []
++    weighted_nll_sum = 0.0
++    token_count = 0
++    for window in tqdm(windows, desc=desc):
++        outputs = llm.generate(
++            [{"prompt_token_ids": window}],
++            sampling_params,
++            use_tqdm=False,
++        )
++        prompt_logprobs = outputs[0].prompt_logprobs
++        if prompt_logprobs is None:
++            raise RuntimeError("vLLM did not return prompt_logprobs.")
++        start = target_start(len(window), window_size)
++        nll = 0.0
++        count = 0
++        for position in range(start, len(window)):
++            nll -= prompt_logprob(prompt_logprobs, position, window[position])
++            count += 1
++        window_nll = nll / count
++        nlls.append(window_nll)
++        weighted_nll_sum += nll
++        token_count += count
++
++    mean_nll = sum(nlls) / len(nlls)
++    token_weighted_nll = weighted_nll_sum / token_count
++    return PPLStats(
++        nll=mean_nll,
++        ppl=math.exp(mean_nll),
++        token_weighted_nll=token_weighted_nll,
++        token_weighted_ppl=math.exp(token_weighted_nll),
++        windows=len(nlls),
++        tokens=token_count,
++    )
++
++
++def build_vllm(
++    args: argparse.Namespace,
++    activation_sparsity_config: dict[str, Any] | None,
++) -> Any:
++    from vllm import LLM
++
++    kwargs: dict[str, Any] = {
++        "model": args.model,
++        "dtype": args.dtype,
++        "max_model_len": args.vllm_max_model_len
++        or (args.context_size + args.window_size + 1),
++        "gpu_memory_utilization": args.vllm_gpu_memory_utilization,
++        "enforce_eager": args.vllm_enforce_eager,
++        "shutdown_timeout": args.vllm_shutdown_timeout,
++    }
++    if activation_sparsity_config is not None:
++        kwargs["activation_sparsity_config"] = activation_sparsity_config
++    return LLM(**kwargs)
++
++
++def run_vllm_reference(
++    args: argparse.Namespace,
++    windows: list[list[int]],
++    calibration_path: Path,
++) -> BackendComparison:
++    dense_llm = build_vllm(args, None)
++    dense = score_vllm_windows(
++        dense_llm,
++        windows,
++        args.window_size,
++        desc="vLLM dense",
++    )
++    del dense_llm
++    gc.collect()
++    if torch.cuda.is_available():
++        torch.cuda.empty_cache()
++
++    sparsity_config = {
++        "enable": True,
++        "method": "teal",
++        "uniform_sparsity": args.sparsity,
++        "calibration_path": str(calibration_path),
++        "decode_only": False,
++        "apply_all_tokens": False,
++        "prefill_sparsify": args.vllm_prefill_sparsify,
++        "strict_unsupported_check": True,
++        "use_sparse_gemv": False,
++    }
++    sparse_llm = build_vllm(args, sparsity_config)
++    sparse = score_vllm_windows(
++        sparse_llm,
++        windows,
++        args.window_size,
++        desc=f"vLLM sparse s={args.sparsity}",
++    )
++    del sparse_llm
++    gc.collect()
++    if torch.cuda.is_available():
++        torch.cuda.empty_cache()
++    return BackendComparison(
++        backend=f"vllm:prefill_sparsify={args.vllm_prefill_sparsify}",
++        dense=dense,
++        sparse=sparse,
++    )
++
++
++def resolve_artifact_paths(args: argparse.Namespace) -> tuple[Path, Path]:
++    artifact_root = args.artifact_root.resolve()
++    histogram_path = (
++        args.hf_histogram_path.resolve()
++        if args.hf_histogram_path is not None
++        else (artifact_root / "official_histograms").resolve()
++    )
++
++    if args.vllm_calibration_path is not None:
++        calibration_path = args.vllm_calibration_path.resolve()
++    else:
++        config_path = artifact_root / "activation_sparsity_config.json"
++        if config_path.exists():
++            config = json.loads(config_path.read_text())
++            calibration_path = Path(config["calibration_path"]).resolve()
++        else:
++            calibration_path = (artifact_root / "thresholds").resolve()
++    return histogram_path, calibration_path
++
++
++def print_comparison(result: BackendComparison) -> None:
++    print(
++        f"{result.backend}: dense_ppl={result.dense.ppl:.6f}, "
++        f"sparse_ppl={result.sparse.ppl:.6f}, "
++        f"delta_ppl={result.delta_ppl:.6f}, "
++        f"delta_nll={result.delta_nll:.6f}, "
++        f"ppl_ratio={result.ppl_ratio:.6f}, "
++        f"windows={result.dense.windows}, tokens={result.dense.tokens}"
++    )
++
++
++def comparison_payload(result: BackendComparison | None) -> dict[str, Any] | None:
++    if result is None:
++        return None
++    payload = asdict(result)
++    payload.update(
++        {
++            "delta_nll": result.delta_nll,
++            "delta_ppl": result.delta_ppl,
++            "ppl_ratio": result.ppl_ratio,
++        }
++    )
++    return payload
++
++
++def assert_alignment(
++    hf_result: BackendComparison | None,
++    vllm_result: BackendComparison | None,
++    args: argparse.Namespace,
++) -> bool:
++    if hf_result is None or vllm_result is None:
++        return True
++    aligned = math.isclose(
++        hf_result.delta_nll,
++        vllm_result.delta_nll,
++        rel_tol=args.delta_nll_rtol,
++        abs_tol=args.delta_nll_atol,
++    )
++    print(
++        "alignment: "
++        f"hf_delta_nll={hf_result.delta_nll:.6f}, "
++        f"vllm_delta_nll={vllm_result.delta_nll:.6f}, "
++        f"abs_diff={abs(hf_result.delta_nll - vllm_result.delta_nll):.6f}, "
++        f"status={'PASS' if aligned else 'FAIL'}"
++    )
++    return aligned
++
++
++def main() -> int:
++    args = parse_args()
++    histogram_path, calibration_path = resolve_artifact_paths(args)
++    tokenizer = load_tokenizer(args.model)
++    texts = load_texts(args)
++    token_ids = build_eval_ids(tokenizer, texts, args.window_size)
++    windows = iter_windows(
++        token_ids,
++        context_size=args.context_size,
++        window_size=args.window_size,
++        max_windows=args.max_windows,
++    )
++
++    from transformers import AutoConfig
++
++    hf_config = AutoConfig.from_pretrained(args.model, trust_remote_code=True)
++    num_layers = int(hf_config.num_hidden_layers)
++    validate_artifacts(histogram_path, calibration_path, num_layers)
++    spot_check_official_distribution(args.teal_repo_path, histogram_path, args.sparsity)
++
++    print(
++        "eval setup: "
++        f"model={args.model}, sparsity={args.sparsity}, "
++        f"tokens={len(token_ids)}, windows={len(windows)}, "
++        f"context={args.context_size}, window={args.window_size}, "
++        f"hf_impl={args.hf_reference_impl}, "
++        f"hf_mode={args.hf_reference_mode}, "
++        f"vllm_prefill={args.vllm_prefill_sparsify}"
++    )
++    print(f"histogram_path={histogram_path}")
++    print(f"vllm_calibration_path={calibration_path}")
++
++    hf_result: BackendComparison | None = None
++    vllm_result: BackendComparison | None = None
++
++    if args.backend in ("both", "hf"):
++        hf_result = run_hf_reference(args, windows, histogram_path)
++        print_comparison(hf_result)
++
++    if args.backend in ("both", "vllm"):
++        vllm_result = run_vllm_reference(args, windows, calibration_path)
++        print_comparison(vllm_result)
++
++    aligned = assert_alignment(hf_result, vllm_result, args)
++
++    if args.json_output:
++        payload = {
++            "setup": {
++                "model": args.model,
++                "sparsity": args.sparsity,
++                "context_size": args.context_size,
++                "window_size": args.window_size,
++                "tokens": len(token_ids),
++                "windows": len(windows),
++                "hf_reference_impl": args.hf_reference_impl,
++                "hf_reference_mode": args.hf_reference_mode,
++                "vllm_prefill_sparsify": args.vllm_prefill_sparsify,
++                "histogram_path": str(histogram_path),
++                "vllm_calibration_path": str(calibration_path),
++            },
++            "hf": comparison_payload(hf_result),
++            "vllm": comparison_payload(vllm_result),
++            "aligned": aligned,
++        }
++        args.json_output.parent.mkdir(parents=True, exist_ok=True)
++        args.json_output.write_text(json.dumps(payload, indent=2) + "\n")
++
++    if not aligned and args.fail_on_mismatch:
++        return 2
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/tests/sparsity/test_config.py b/tests/sparsity/test_config.py
+index 63c073a25b3..90200c4d19f 100644
+--- a/tests/sparsity/test_config.py
++++ b/tests/sparsity/test_config.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ 
+ import pytest
++from pydantic import ValidationError
+ 
+ from vllm.sparsity.config import ActivationSparsityConfig
+ 
+@@ -12,7 +13,8 @@ def test_activation_sparsity_config_defaults():
+     assert cfg.uniform_sparsity == 0.0
+     assert cfg.calibration_path is None
+     assert cfg.decode_only is False
+-    assert cfg.apply_all_tokens is True
++    assert cfg.apply_all_tokens is False
++    assert cfg.prefill_sparsify == "half"
+     assert cfg.strict_unsupported_check is True
+     assert cfg.use_sparse_gemv is False
+ 
+@@ -32,5 +34,8 @@ def test_activation_sparsity_config_hash():
+ 
+ def test_activation_sparsity_config_invalid_method():
+     # Pydantic dataclass with extra="forbid" should reject unknown fields
+-    with pytest.raises(TypeError):
++    with pytest.raises((TypeError, ValidationError)):
+         ActivationSparsityConfig(unknown_field=True)
++
++    with pytest.raises((ValueError, ValidationError)):
++        ActivationSparsityConfig(prefill_sparsify="last_token")
+diff --git a/tests/sparsity/test_distribution.py b/tests/sparsity/test_distribution.py
+index 2b4da32b7e9..d837de7f6fc 100644
+--- a/tests/sparsity/test_distribution.py
++++ b/tests/sparsity/test_distribution.py
+@@ -1,8 +1,10 @@
+ # SPDX-License-Identifier: Apache-2.0
+ 
+-import pytest
++from types import SimpleNamespace
++
+ import torch
+ 
++from vllm.forward_context import ForwardContext, override_forward_context
+ from vllm.sparsity.distribution import Distribution, SparsifyFn
+ 
+ 
+@@ -75,43 +77,67 @@ def test_sparsify_fn_moved_threshold():
+     assert sparsify.threshold.device.type == "cpu"
+ 
+ 
+-def test_sparsify_fn_with_rotation_roundtrip():
+-    """With threshold=0, La RoSA should recover x (up to dtype)."""
+-    hidden = 16
+-    d = torch.randn(hidden, hidden)
+-    inv_d = torch.linalg.inv(d)
+-    from vllm.sparsity.rotation import RotationTransform
+-
+-    rot = RotationTransform(d_matrix=d, inv_d_matrix=inv_d)
+-    sparsify = SparsifyFn(threshold=torch.tensor(0.0), rotation=rot)
++def test_sparsify_fn_prefill_half_3d_matches_official_behavior():
++    threshold = torch.tensor(1e6)
++    sparsify = SparsifyFn(threshold)
+ 
+-    x = torch.randn(4, hidden)
++    x = torch.ones(1, 4, 3)
+     out = sparsify(x)
+-    assert torch.allclose(out, x.to(out.dtype), atol=1e-4)
++    assert torch.allclose(out[:, :2, :], x[:, :2, :])
++    assert out[:, 2:, :].abs().max() == 0.0
+ 
++    decode_x = torch.ones(2, 1, 3)
++    decode_out = sparsify(decode_x)
++    assert decode_out.abs().max() == 0.0
+ 
+-def test_sparsify_fn_with_rotation_sparsity():
+-    """La RoSA should sparsify in rotated space and recover."""
+-    hidden = 16
+-    d = torch.eye(hidden)  # identity rotation for simplicity
+-    inv_d = torch.eye(hidden)
+-    from vllm.sparsity.rotation import RotationTransform
+ 
+-    rot = RotationTransform(d_matrix=d, inv_d_matrix=inv_d)
+-    sparsify = SparsifyFn(threshold=torch.tensor(0.5), rotation=rot)
++def test_sparsify_fn_prefill_half_2d_fallback_masks_last_half():
++    threshold = torch.tensor(1e6)
++    sparsify = SparsifyFn(threshold)
+ 
+-    x = torch.randn(10, hidden)
++    x = torch.ones(4, 3)
+     out = sparsify(x)
+-    # With identity rotation, behavior should match plain TEAL
+-    expected = SparsifyFn(threshold=torch.tensor(0.5))(x)
+-    assert torch.allclose(out, expected, atol=1e-6)
++    assert torch.allclose(out[:2], x[:2])
++    assert out[2:].abs().max() == 0.0
+ 
++    decode_x = torch.ones(1, 3)
++    decode_out = sparsify(decode_x)
++    assert decode_out.abs().max() == 0.0
+ 
+-def test_sparsify_fn_rotation_device_movement():
+-    """Rotation buffers should follow module.to(device)."""
+-    hidden = 8
+-    rot = RotationTransform(d_matrix=torch.eye(hidden), inv_d_matrix=torch.eye(hidden))
+-    sparsify = SparsifyFn(threshold=torch.tensor(0.5), rotation=rot)
+-    sparsify.to("cpu")
+-    assert sparsify.rotation.D.device.type == "cpu"
+-    assert sparsify.rotation.inv_D.device.type == "cpu"
++
++def test_sparsify_fn_prefill_half_2d_uses_vllm_query_slices():
++    threshold = torch.tensor(1e6)
++    sparsify = SparsifyFn(threshold)
++    metadata = {
++        "layer.0": SimpleNamespace(
++            query_start_loc=torch.tensor([0, 4, 5]),
++            num_actual_tokens=5,
++        )
++    }
++    context = ForwardContext(
++        no_compile_layers={},
++        attn_metadata=metadata,
++        slot_mapping={},
++    )
++
++    x = torch.ones(5, 3)
++    with override_forward_context(context):
++        out = sparsify(x)
++
++    assert torch.allclose(out[:2], x[:2])
++    assert out[2:4].abs().max() == 0.0
++    assert out[4:].abs().max() == 0.0
++
++
++def test_sparsify_fn_prefill_none_is_decode_only():
++    threshold = torch.tensor(1e6)
++    sparsify = SparsifyFn(
++        threshold,
++        apply_all_tokens=False,
++        prefill_sparsify="none",
++    )
++
++    prefill_x = torch.ones(1, 4, 3)
++    decode_x = torch.ones(1, 1, 3)
++    assert torch.allclose(sparsify(prefill_x), prefill_x)
++    assert sparsify(decode_x).abs().max() == 0.0
+diff --git a/tests/sparsity/test_layers.py b/tests/sparsity/test_layers.py
+index bc20d3d2e71..45f138807ea 100644
+--- a/tests/sparsity/test_layers.py
++++ b/tests/sparsity/test_layers.py
+@@ -23,9 +23,7 @@ def test_build_sparsifier_no_calibration_path():
+ 
+ 
+ def test_build_sparsifier_missing_threshold():
+-    cfg = ActivationSparsityConfig(
+-        enable=True, calibration_path="/nonexistent/path"
+-    )
++    cfg = ActivationSparsityConfig(enable=True, calibration_path="/nonexistent/path")
+     with pytest.raises(FileNotFoundError):
+         build_sparsifier(cfg, layer_idx=0, proj_name="mlp.gate_up")
+ 
+@@ -33,9 +31,7 @@ def test_build_sparsifier_missing_threshold():
+ def test_build_sparsifier_success():
+     with tempfile.TemporaryDirectory() as tmpdir:
+         # Write a dummy threshold file
+-        threshold_path = os.path.join(
+-            tmpdir, "layers.0.mlp.gate_up.threshold.pt"
+-        )
++        threshold_path = os.path.join(tmpdir, "layers.0.mlp.gate_up.threshold.pt")
+         torch.save(torch.tensor(0.5), threshold_path)
+ 
+         cfg = ActivationSparsityConfig(
+@@ -44,23 +40,39 @@ def test_build_sparsifier_success():
+         sparsifier = build_sparsifier(cfg, layer_idx=0, proj_name="mlp.gate_up")
+ 
+         assert sparsifier is not None
++        assert sparsifier.apply_all_tokens is True
++        assert sparsifier.prefill_sparsify == "half"
+         x = torch.randn(4, 8)
+         out = sparsifier(x)
+         # With threshold 0.5, some values should be zeroed
+         assert (out == 0).any()
+ 
+ 
++def test_build_sparsifier_prefill_half_default():
++    with tempfile.TemporaryDirectory() as tmpdir:
++        threshold_path = os.path.join(tmpdir, "layers.0.mlp.gate_up.threshold.pt")
++        torch.save(torch.tensor(0.5), threshold_path)
++
++        cfg = ActivationSparsityConfig(enable=True, calibration_path=tmpdir)
++        sparsifier = build_sparsifier(cfg, layer_idx=0, proj_name="mlp.gate_up")
++
++        assert sparsifier is not None
++        assert sparsifier.apply_all_tokens is False
++        assert sparsifier.prefill_sparsify == "half"
++
++
+ def test_build_sparsifier_larosa():
+     with tempfile.TemporaryDirectory() as tmpdir:
+         # Threshold
+-        torch.save(torch.tensor(0.5), os.path.join(tmpdir, "layers.2.self_attn.qkv.threshold.pt"))
+-        # Rotation matrices
++        torch.save(
++            torch.tensor(0.5),
++            os.path.join(tmpdir, "layers.2.self_attn.qkv.threshold.pt"),
++        )
++        # Rotation matrices are load-time weight artifacts, not SparsifyFn modules.
+         os.makedirs(os.path.join(tmpdir, "layers.2.self_attn.qkv"))
+         hidden = 16
+         d = torch.eye(hidden)
+-        inv_d = torch.eye(hidden)
+         torch.save(d, os.path.join(tmpdir, "layers.2.self_attn.qkv", "D.pt"))
+-        torch.save(inv_d, os.path.join(tmpdir, "layers.2.self_attn.qkv", "inv_D.pt"))
+ 
+         cfg = ActivationSparsityConfig(
+             enable=True,
+@@ -71,9 +83,8 @@ def test_build_sparsifier_larosa():
+         sparsifier = build_sparsifier(cfg, layer_idx=2, proj_name="self_attn.qkv")
+ 
+         assert sparsifier is not None
+-        assert sparsifier.rotation is not None
+         x = torch.randn(4, hidden)
+         out = sparsifier(x)
+         assert out.shape == x.shape
+-        # With identity rotation + threshold 0.5, some values should be zeroed
++        # SparsifyFn itself remains a plain mask; rotations are merged into weights.
+         assert (out == 0).any()
+diff --git a/tests/sparsity/test_rotation.py b/tests/sparsity/test_rotation.py
+index b8603e29489..700e5cd1c3c 100644
+--- a/tests/sparsity/test_rotation.py
++++ b/tests/sparsity/test_rotation.py
+@@ -1,9 +1,12 @@
+ # SPDX-License-Identifier: Apache-2.0
+ 
+-import pytest
+ import torch
+ 
+-from vllm.sparsity.rotation import RotationTransform
++from vllm.sparsity.rotation import (
++    RotationTransform,
++    merge_rotation_into_weight,
++    merge_rotation_into_weight_loader,
++)
+ 
+ 
+ def test_rotation_transform_roundtrip():
+@@ -28,3 +31,37 @@ def test_rotation_transform_shape():
+     x = torch.randn(3, 8)
+     out = rot(x)
+     assert out.shape == (3, 8)
++
++
++def test_merge_rotation_into_weight():
++    weight = torch.randn(4, 8)
++    rotation = torch.randn(8, 8)
++
++    merged = merge_rotation_into_weight(weight, rotation)
++
++    assert torch.allclose(merged, weight @ rotation, atol=1e-5)
++
++
++def test_merge_rotation_into_weight_loader():
++    class DummyWeight:
++        def __init__(self):
++            self.loaded = None
++            self.weight_loader = self._load
++
++        def _load(self, param, loaded_weight):
++            self.loaded = loaded_weight
++
++    class DummyLinear:
++        def __init__(self):
++            self.weight = DummyWeight()
++
++    linear = DummyLinear()
++    rotation = torch.eye(4) * 2
++    assert merge_rotation_into_weight_loader(
++        linear, rotation, proj_name="layers.0.self_attn.qkv"
++    )
++
++    loaded_weight = torch.ones(3, 4)
++    linear.weight.weight_loader(linear.weight, loaded_weight)
++
++    assert torch.allclose(linear.weight.loaded, loaded_weight @ rotation)
+diff --git a/tests/sparsity/test_vllm_config.py b/tests/sparsity/test_vllm_config.py
+index 98ec6a72428..19b3eb8fd9e 100644
+--- a/tests/sparsity/test_vllm_config.py
++++ b/tests/sparsity/test_vllm_config.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ 
+ import pytest
++from pydantic import ValidationError
+ 
+ from vllm.sparsity.config import ActivationSparsityConfig
+ 
+@@ -29,5 +30,5 @@ def test_activation_sparsity_in_vllm_config_hash():
+ 
+ def test_activation_sparsity_config_validation():
+     """Pydantic extra=forbid should reject unknown keys."""
+-    with pytest.raises(TypeError):
++    with pytest.raises((TypeError, ValidationError)):
+         ActivationSparsityConfig(unknown_field=123)
+diff --git a/vllm/model_executor/models/llama.py b/vllm/model_executor/models/llama.py
+index 7fc2af1102f..6c809ef8f70 100644
+--- a/vllm/model_executor/models/llama.py
++++ b/vllm/model_executor/models/llama.py
+@@ -33,7 +33,6 @@ from transformers import LlamaConfig
+ 
+ from vllm.compilation.decorators import support_torch_compile
+ from vllm.config import CacheConfig, VllmConfig
+-from vllm.sparsity import build_sparsifier
+ from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
+ from vllm.model_executor.layers.activation import SiluAndMul
+ from vllm.model_executor.layers.attention import (
+@@ -54,6 +53,11 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
+     VocabParallelEmbedding,
+ )
+ from vllm.sequence import IntermediateTensors
++from vllm.sparsity import (
++    ActivationSparsityConfig,
++    build_sparsifier,
++    merge_larosa_rotation_into_linear,
++)
+ from vllm.v1.attention.backend import AttentionType
+ 
+ from .adapters import as_embedding_model, as_seq_cls_model
+@@ -119,6 +123,12 @@ class LlamaMLP(nn.Module):
+             layer_idx = extract_layer_index(prefix)
+         except Exception:
+             layer_idx = 0
++        merge_larosa_rotation_into_linear(
++            sparsity_config, layer_idx, "mlp.gate_up", self.gate_up_proj
++        )
++        merge_larosa_rotation_into_linear(
++            sparsity_config, layer_idx, "mlp.down", self.down_proj
++        )
+         self.sparsify_gate_up = (
+             build_sparsifier(sparsity_config, layer_idx, "mlp.gate_up")
+             if sparsity_config is not None
+@@ -242,6 +252,12 @@ class LlamaAttention(nn.Module):
+         )
+ 
+         # TEAL / La RoSA injection points
++        merge_larosa_rotation_into_linear(
++            sparsity_config, layer_idx, "self_attn.qkv", self.qkv_proj
++        )
++        merge_larosa_rotation_into_linear(
++            sparsity_config, layer_idx, "self_attn.o", self.o_proj
++        )
+         self.sparsify_qkv = (
+             build_sparsifier(sparsity_config, layer_idx, "self_attn.qkv")
+             if sparsity_config is not None
+diff --git a/vllm/model_executor/models/qwen2.py b/vllm/model_executor/models/qwen2.py
+index 9dbb650ae48..05d48059b36 100644
+--- a/vllm/model_executor/models/qwen2.py
++++ b/vllm/model_executor/models/qwen2.py
+@@ -35,7 +35,6 @@ from transformers import Qwen2Config
+ 
+ from vllm.compilation.decorators import support_torch_compile
+ from vllm.config import CacheConfig, VllmConfig
+-from vllm.sparsity import build_sparsifier
+ from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
+ from vllm.model_executor.layers.activation import SiluAndMul
+ from vllm.model_executor.layers.attention import (
+@@ -56,6 +55,11 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
+     VocabParallelEmbedding,
+ )
+ from vllm.sequence import IntermediateTensors
++from vllm.sparsity import (
++    ActivationSparsityConfig,
++    build_sparsifier,
++    merge_larosa_rotation_into_linear,
++)
+ from vllm.transformers_utils.config import is_interleaved, set_default_rope_theta
+ from vllm.v1.attention.backend import AttentionType
+ 
+@@ -113,6 +117,12 @@ class Qwen2MLP(nn.Module):
+             layer_idx = extract_layer_index(prefix)
+         except Exception:
+             layer_idx = 0
++        merge_larosa_rotation_into_linear(
++            sparsity_config, layer_idx, "mlp.gate_up", self.gate_up_proj
++        )
++        merge_larosa_rotation_into_linear(
++            sparsity_config, layer_idx, "mlp.down", self.down_proj
++        )
+         self.sparsify_gate_up = (
+             build_sparsifier(sparsity_config, layer_idx, "mlp.gate_up")
+             if sparsity_config is not None
+@@ -226,6 +236,12 @@ class Qwen2Attention(nn.Module):
+         )
+ 
+         layer_idx = extract_layer_index(prefix)
++        merge_larosa_rotation_into_linear(
++            sparsity_config, layer_idx, "self_attn.qkv", self.qkv_proj
++        )
++        merge_larosa_rotation_into_linear(
++            sparsity_config, layer_idx, "self_attn.o", self.o_proj
++        )
+         self.sparsify_qkv = (
+             build_sparsifier(sparsity_config, layer_idx, "self_attn.qkv")
+             if sparsity_config is not None
+diff --git a/vllm/sparsity/__init__.py b/vllm/sparsity/__init__.py
+index c2ee3d03368..af16169c9e8 100644
+--- a/vllm/sparsity/__init__.py
++++ b/vllm/sparsity/__init__.py
+@@ -3,12 +3,7 @@
+ 
+ from vllm.sparsity.config import ActivationSparsityConfig
+ from vllm.sparsity.distribution import Distribution, SparsifyFn
+-from vllm.sparsity.layers import build_sparsifier
+ from vllm.sparsity.rotation import RotationTransform
+-from vllm.sparsity.utils import (
+-    get_activation_sparsity_config,
+-    load_threshold,
+-)
+ 
+ __all__ = [
+     "ActivationSparsityConfig",
+@@ -16,6 +11,19 @@ __all__ = [
+     "Distribution",
+     "get_activation_sparsity_config",
+     "load_threshold",
++    "merge_larosa_rotation_into_linear",
+     "RotationTransform",
+     "SparsifyFn",
+ ]
++
++
++def __getattr__(name: str):
++    if name in {"build_sparsifier", "merge_larosa_rotation_into_linear"}:
++        from vllm.sparsity import layers
++
++        return getattr(layers, name)
++    if name in {"get_activation_sparsity_config", "load_threshold"}:
++        from vllm.sparsity import utils
++
++        return getattr(utils, name)
++    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+diff --git a/vllm/sparsity/config.py b/vllm/sparsity/config.py
+index 74a765dd3ba..6860348d3fb 100644
+--- a/vllm/sparsity/config.py
++++ b/vllm/sparsity/config.py
+@@ -1,17 +1,21 @@
+ # SPDX-License-Identifier: Apache-2.0
+ """Configuration for activation sparsity (TEAL / La RoSA)."""
+ 
+-from typing import Optional
++import hashlib
++import json
++from dataclasses import fields
+ 
+-from vllm.config.utils import config, get_hash_factors, hash_factors
++from pydantic import ConfigDict
++from pydantic.dataclasses import dataclass
+ 
+ 
+-@config
++@dataclass(config=ConfigDict(extra="forbid"))
+ class ActivationSparsityConfig:
+     """Configuration for TEAL / La RoSA activation sparsity.
+ 
+-    Phase 0 (MVP) defaults are chosen for correctness verification:
+-    - ``apply_all_tokens=True`` to avoid prefill/decode detection complexity.
++    Defaults are chosen to match the public TEAL HF reference:
++    - ``prefill_sparsify="half"`` sparsifies only the last half of prefill
++      activations while still sparsifying single-token decode activations.
+     - ``strict_unsupported_check=True`` to fail fast on TP/quant/LoRA.
+     - ``use_sparse_gemv=False`` because sparse GEMV is a Phase 2 experiment.
+     """
+@@ -30,7 +34,7 @@ class ActivationSparsityConfig:
+     are zeroed out."""
+ 
+     # Calibration artifacts
+-    calibration_path: Optional[str] = None
++    calibration_path: str | None = None
+     """Directory containing calibration artifacts:
+     ``histograms.pt``, per-layer ``threshold.pt``, and (for La RoSA)
+     ``D.pt`` / ``inv_D.pt``."""
+@@ -40,10 +44,18 @@ class ActivationSparsityConfig:
+     """If True, only apply sparsity during decode (not prefill).
+     Phase 0 defaults to False."""
+ 
+-    # Phase 0 safety switch
+-    apply_all_tokens: bool = True
++    # Legacy safety switch
++    apply_all_tokens: bool = False
+     """If True, apply sparsity to all tokens regardless of prefill/decode.
+-    This simplifies Phase 0 correctness validation."""
++    This preserves the original Phase 0 behaviour and overrides
++    ``prefill_sparsify``."""
++
++    # Prefill sparsification policy
++    prefill_sparsify: str = "half"
++    """Prefill sparsification policy when ``decode_only=False``:
++    ``"half"`` matches the public TEAL HF reference by sparsifying the last
++    half of each prefill query, ``"all"`` sparsifies all prefill tokens, and
++    ``"none"`` sparsifies only decode tokens."""
+ 
+     # Unsupported combination guard
+     strict_unsupported_check: bool = True
+@@ -54,11 +66,23 @@ class ActivationSparsityConfig:
+     use_sparse_gemv: bool = False
+     """Enable Triton sparse GEMV custom op. Phase 2 experimental feature."""
+ 
++    def __post_init__(self) -> None:
++        if self.method not in {"teal", "larosa"}:
++            raise ValueError(
++                "Activation sparsity method must be 'teal' or 'larosa', "
++                f"got {self.method!r}."
++            )
++        if self.prefill_sparsify not in {"half", "all", "none"}:
++            raise ValueError(
++                "prefill_sparsify must be one of 'half', 'all', or 'none', "
++                f"got {self.prefill_sparsify!r}."
++            )
++
+     def compute_hash(self) -> str:
+         """Return a hash that uniquely identifies this sparsity config.
+ 
+         Must be included in :meth:`VllmConfig.compute_hash` so that
+         compilation caches are invalidated when sparsity settings change.
+         """
+-        factors = get_hash_factors(self, ignored_factors=set())
+-        return hash_factors(factors)
++        factors = {field.name: getattr(self, field.name) for field in fields(self)}
++        return hashlib.sha256(json.dumps(factors, sort_keys=True).encode()).hexdigest()
+diff --git a/vllm/sparsity/distribution.py b/vllm/sparsity/distribution.py
+index a296a459b80..75b5b729c4b 100644
+--- a/vllm/sparsity/distribution.py
++++ b/vllm/sparsity/distribution.py
+@@ -4,8 +4,6 @@
+ import torch
+ from torch import nn
+ 
+-from vllm.forward_context import get_forward_context
+-
+ 
+ class Distribution:
+     """Histogram-based distribution for threshold calibration.
+@@ -16,8 +14,8 @@ class Distribution:
+ 
+     def __init__(self, histogram: torch.Tensor, bin_edges: torch.Tensor) -> None:
+         """Args:
+-            histogram: 1-D tensor of counts per bin.
+-            bin_edges: 1-D tensor of bin boundaries (length = histogram + 1).
++        histogram: 1-D tensor of counts per bin.
++        bin_edges: 1-D tensor of bin boundaries (length = histogram + 1).
+         """
+         if histogram.dim() != 1:
+             raise ValueError(f"histogram must be 1-D, got {histogram.dim()}-D")
+@@ -64,10 +62,7 @@ class Distribution:
+         cls, histograms: dict[str, torch.Tensor], bin_edges: torch.Tensor
+     ) -> dict[str, "Distribution"]:
+         """Build a dict of Distributions from a histogram dict."""
+-        return {
+-            name: cls(hist, bin_edges)
+-            for name, hist in histograms.items()
+-        }
++        return {name: cls(hist, bin_edges) for name, hist in histograms.items()}
+ 
+ 
+ class SparsifyFn(nn.Module):
+@@ -75,61 +70,222 @@ class SparsifyFn(nn.Module):
+ 
+     For Phase 0 this uses a dense ``torch.where`` so that correctness
+     can be validated without requiring a sparse GEMV kernel.
+-
+-    When ``rotation`` is provided (La RoSA mode), the forward pass becomes:
+-    ``x @ D -> sparsify -> x @ inv_D``.
+     """
+ 
+     def __init__(
+         self,
+         threshold: torch.Tensor,
+-        apply_all_tokens: bool = True,
+-        rotation: "RotationTransform | None" = None,
++        decode_only: bool = False,
++        apply_all_tokens: bool = False,
++        prefill_sparsify: str = "half",
+     ) -> None:
+         super().__init__()
++        if prefill_sparsify not in {"half", "all", "none"}:
++            raise ValueError(
++                "prefill_sparsify must be one of 'half', 'all', or 'none', "
++                f"got {prefill_sparsify!r}."
++            )
+         # Register as buffer so threshold moves with module.to(device/dtype)
+         self.register_buffer("threshold", threshold)
++        self.decode_only = decode_only
+         self.apply_all_tokens = apply_all_tokens
+-        self.rotation = rotation
+-        if rotation is not None:
+-            # Register rotation as a submodule so it follows .to(device/dtype)
+-            self.add_module("_rotation", rotation)
++        self.prefill_sparsify = prefill_sparsify
+ 
+     def forward(self, x: torch.Tensor) -> torch.Tensor:
+-        # Phase 0: apply to all tokens by default.
+-        # Phase 1 will add decode-only detection here.
+-        if not self.apply_all_tokens and not self._is_decode_only_batch():
+-            return x
++        if self.apply_all_tokens:
++            return self._apply_mask(x)
++
++        if self.decode_only:
++            return self._apply_decode_only(x)
+ 
+-        if self.rotation is not None:
+-            x = self.rotation(x)
++        if self.prefill_sparsify == "all":
++            return self._apply_mask(x)
+ 
+-        x = torch.where(
++        if self.prefill_sparsify == "none":
++            return self._apply_decode_only(x)
++
++        if self.prefill_sparsify == "half":
++            return self._apply_prefill_half(x)
++
++        raise ValueError(
++            "prefill_sparsify must be one of 'half', 'all', or 'none', "
++            f"got {self.prefill_sparsify!r}."
++        )
++
++    def _apply_mask(self, x: torch.Tensor) -> torch.Tensor:
++        return torch.where(
+             x.abs() > self.threshold.to(dtype=x.dtype, device=x.device),
+             x,
+             torch.zeros_like(x),
+         )
+ 
+-        if self.rotation is not None:
+-            x = self.rotation.inverse(x).to(x.dtype)
++    def _apply_rows(self, x: torch.Tensor, row_mask: torch.Tensor) -> torch.Tensor:
++        if row_mask.numel() != x.shape[0]:
++            raise ValueError(
++                f"row_mask length ({row_mask.numel()}) must equal "
++                f"input rows ({x.shape[0]})."
++            )
++        masked = self._apply_mask(x)
++        view_shape = (row_mask.numel(),) + (1,) * (x.dim() - 1)
++        row_mask = row_mask.to(device=x.device).view(view_shape)
++        return torch.where(row_mask, masked, x)
+ 
+-        return x
++    def _apply_prefill_half(self, x: torch.Tensor) -> torch.Tensor:
++        if x.dim() == 3:
++            seq_len = x.shape[1]
++            if seq_len == 1:
++                return self._apply_mask(x)
++            half_seq_len = seq_len // 2
++            if half_seq_len == 0:
++                return x
++            return torch.cat(
++                (
++                    x[:, :-half_seq_len, :],
++                    self._apply_mask(x[:, -half_seq_len:, :]),
++                ),
++                dim=1,
++            )
+ 
+-    def _is_decode_only_batch(self) -> bool:
+-        """Return True if the current forward batch is decode-only.
++        if x.dim() != 2:
++            return self._apply_mask(x)
+ 
+-        Phase 1 implementation: inspect ForwardContext.attn_metadata.
+-        For now always returns False so that ``apply_all_tokens`` controls
+-        the behaviour.
+-        """
+-        # TODO(Phase 1): inspect get_forward_context().attn_metadata to
+-        # determine whether every sequence in the batch has query_len == 1.
+-        return False
++        row_mask = self._get_vllm_prefill_half_row_mask(x)
++        if row_mask is None:
++            if x.shape[0] == 1:
++                return self._apply_mask(x)
++            half_seq_len = x.shape[0] // 2
++            if half_seq_len == 0:
++                return x
++            row_mask = torch.zeros(x.shape[0], dtype=torch.bool, device=x.device)
++            row_mask[-half_seq_len:] = True
++        return self._apply_rows(x, row_mask)
++
++    def _apply_decode_only(self, x: torch.Tensor) -> torch.Tensor:
++        if x.dim() == 3:
++            return self._apply_mask(x) if x.shape[1] == 1 else x
++
++        if x.dim() != 2:
++            return self._apply_mask(x)
++
++        row_mask = self._get_vllm_decode_row_mask(x)
++        if row_mask is None:
++            return self._apply_mask(x) if x.shape[0] == 1 else x
++        return self._apply_rows(x, row_mask)
++
++    def _get_vllm_decode_row_mask(self, x: torch.Tensor) -> torch.Tensor | None:
++        request_slices = self._get_vllm_request_slices(x)
++        if request_slices is None:
++            return None
++
++        cache_key = (
++            "decode",
++            x.device.type,
++            x.device.index,
++            x.shape[0],
++            tuple(request_slices),
++        )
++        cached = self._get_cached_forward_mask(cache_key)
++        if cached is not None:
++            return cached
++
++        row_mask = torch.zeros(x.shape[0], dtype=torch.bool, device=x.device)
++        for start, end in request_slices:
++            if end - start == 1:
++                row_mask[start:end] = True
++        self._set_cached_forward_mask(cache_key, row_mask)
++        return row_mask
++
++    def _get_vllm_prefill_half_row_mask(self, x: torch.Tensor) -> torch.Tensor | None:
++        request_slices = self._get_vllm_request_slices(x)
++        if request_slices is None:
++            return None
++
++        cache_key = (
++            "prefill_half",
++            x.device.type,
++            x.device.index,
++            x.shape[0],
++            tuple(request_slices),
++        )
++        cached = self._get_cached_forward_mask(cache_key)
++        if cached is not None:
++            return cached
++
++        row_mask = torch.zeros(x.shape[0], dtype=torch.bool, device=x.device)
++        for start, end in request_slices:
++            query_len = end - start
++            if query_len == 1:
++                row_mask[start:end] = True
++                continue
++            half_query_len = query_len // 2
++            if half_query_len > 0:
++                row_mask[end - half_query_len : end] = True
++
++        self._set_cached_forward_mask(cache_key, row_mask)
++        return row_mask
++
++    def _get_cached_forward_mask(self, cache_key: tuple) -> torch.Tensor | None:
++        from vllm.forward_context import (
++            get_forward_context,
++            is_forward_context_available,
++        )
++
++        if not is_forward_context_available():
++            return None
++        context = get_forward_context()
++        cache = context.additional_kwargs.setdefault("teal_sparsify_masks", {})
++        return cache.get(cache_key)
++
++    def _set_cached_forward_mask(self, cache_key: tuple, mask: torch.Tensor) -> None:
++        from vllm.forward_context import (
++            get_forward_context,
++            is_forward_context_available,
++        )
++
++        if not is_forward_context_available():
++            return
++        context = get_forward_context()
++        cache = context.additional_kwargs.setdefault("teal_sparsify_masks", {})
++        cache[cache_key] = mask
++
++    def _get_vllm_request_slices(self, x: torch.Tensor) -> list[tuple[int, int]] | None:
++        from vllm.forward_context import (
++            get_forward_context,
++            is_forward_context_available,
++        )
++
++        if not is_forward_context_available():
++            return None
++
++        context = get_forward_context()
++        metadata = context.attn_metadata
++        if isinstance(metadata, list):
++            metadata = metadata[0] if metadata else None
++        if isinstance(metadata, dict):
++            metadata = next(iter(metadata.values()), None)
++        if metadata is None or not hasattr(metadata, "query_start_loc"):
++            return None
++
++        query_start_loc = metadata.query_start_loc
++        if query_start_loc is None or query_start_loc.numel() < 2:
++            return None
++
++        num_actual_tokens = getattr(metadata, "num_actual_tokens", x.shape[0])
++        num_actual_tokens = min(int(num_actual_tokens), x.shape[0])
++
++        starts = query_start_loc.detach().to("cpu").tolist()
++        request_slices: list[tuple[int, int]] = []
++        for start, end in zip(starts, starts[1:]):
++            start = max(0, min(int(start), num_actual_tokens))
++            end = max(start, min(int(end), num_actual_tokens))
++            if end > start:
++                request_slices.append((start, end))
++        return request_slices
+ 
+     def extra_repr(self) -> str:
+-        has_rot = self.rotation is not None
+         return (
+             f"threshold={self.threshold.item():.4f}, "
++            f"decode_only={self.decode_only}, "
+             f"apply_all_tokens={self.apply_all_tokens}, "
+-            f"has_rotation={has_rot}"
++            f"prefill_sparsify={self.prefill_sparsify}"
+         )
+diff --git a/vllm/sparsity/layers.py b/vllm/sparsity/layers.py
+index d39e74b5283..668d1ff4854 100644
+--- a/vllm/sparsity/layers.py
++++ b/vllm/sparsity/layers.py
+@@ -1,15 +1,17 @@
+ # SPDX-License-Identifier: Apache-2.0
+ """Layer helpers for injecting activation sparsity."""
+ 
+-import os
+-from typing import Optional
+-
+ import torch
++from torch import nn
+ 
+ from vllm.logger import init_logger
+ from vllm.sparsity.config import ActivationSparsityConfig
+ from vllm.sparsity.distribution import SparsifyFn
+-from vllm.sparsity.rotation import RotationTransform
++from vllm.sparsity.rotation import (
++    find_rotation_matrix_path,
++    load_rotation_matrix,
++    merge_rotation_into_weight_loader,
++)
+ from vllm.sparsity.utils import load_threshold
+ 
+ logger = init_logger(__name__)
+@@ -20,7 +22,7 @@ def build_sparsifier(
+     layer_idx: int,
+     proj_name: str,
+     device: torch.device | str = "cpu",
+-) -> Optional[SparsifyFn]:
++) -> SparsifyFn | None:
+     """Build a :class:`SparsifyFn` for a given layer and projection.
+ 
+     Args:
+@@ -50,27 +52,55 @@ def build_sparsifier(
+         device=str(device),
+     )
+ 
+-    # La RoSA: load rotation if D/inv_D exist
+-    rotation = None
+-    if sparsity_config.method == "larosa":
+-        rotation_dir = os.path.join(
+-            sparsity_config.calibration_path,
+-            f"layers.{layer_idx}.{proj_name}",
+-        )
+-        d_path = os.path.join(rotation_dir, "D.pt")
+-        inv_d_path = os.path.join(rotation_dir, "inv_D.pt")
+-        if os.path.exists(d_path) and os.path.exists(inv_d_path):
+-            rotation = RotationTransform(d_path=d_path, inv_d_path=inv_d_path)
+-            logger.debug(
+-                "La RoSA rotation enabled for layer %d projection %s",
+-                layer_idx,
+-                proj_name,
+-            )
+-
+     sparsify_fn = SparsifyFn(
+         threshold=threshold,
++        decode_only=sparsity_config.decode_only,
+         apply_all_tokens=sparsity_config.apply_all_tokens,
+-        rotation=rotation,
++        prefill_sparsify=sparsity_config.prefill_sparsify,
+     )
+ 
+     return sparsify_fn
++
++
++def merge_larosa_rotation_into_linear(
++    sparsity_config: ActivationSparsityConfig | None,
++    layer_idx: int,
++    proj_name: str,
++    linear_layer: nn.Module,
++) -> bool:
++    """Merge offline La RoSA rotation into a linear layer's load-time weight.
++
++    Calibration artifacts are expected under:
++    ``{calibration_path}/layers.{layer_idx}.{proj_name}/D.pt``.
++    ``Q.pt`` and ``rotation.pt`` are accepted aliases for exporter convenience.
++    """
++    if sparsity_config is None or sparsity_config.method != "larosa":
++        return False
++    if not sparsity_config.enable or not sparsity_config.calibration_path:
++        return False
++
++    rotation_path = find_rotation_matrix_path(
++        sparsity_config.calibration_path,
++        layer_idx,
++        proj_name,
++    )
++    if rotation_path is None:
++        logger.debug(
++            "No La RoSA rotation matrix for layer %d projection %s",
++            layer_idx,
++            proj_name,
++        )
++        return False
++
++    if getattr(linear_layer, "quant_config", None) is not None:
++        raise ValueError(
++            "La RoSA load-time rotation merge currently supports only "
++            f"unquantized linear layers; got quantized projection {proj_name}."
++        )
++
++    rotation = load_rotation_matrix(rotation_path)
++    return merge_rotation_into_weight_loader(
++        linear_layer,
++        rotation,
++        proj_name=f"layers.{layer_idx}.{proj_name}",
++    )
+diff --git a/vllm/sparsity/rotation.py b/vllm/sparsity/rotation.py
+index d19d29608ea..a4054f0eae9 100644
+--- a/vllm/sparsity/rotation.py
++++ b/vllm/sparsity/rotation.py
+@@ -1,18 +1,22 @@
+ # SPDX-License-Identifier: Apache-2.0
+ """La RoSA rotation matrix support."""
+ 
++import os
++from collections.abc import Callable
++
+ import torch
+ from torch import nn
+ 
++from vllm.logger import init_logger
+ 
+-class RotationTransform(nn.Module):
+-    """Wrapper for La RoSA rotation matrix ``D`` and its inverse ``inv_D``.
++logger = init_logger(__name__)
+ 
+-    Applies ``x @ D`` before sparsification and ``x @ inv_D`` after.
+-    Both matrices are registered as buffers so they follow the module's
+-    device/dtype automatically.
+ 
+-    Phase 3 only: La RoSA is not part of the Phase 0 MVP.
++class RotationTransform(nn.Module):
++    """Legacy wrapper for explicit La RoSA online rotation.
++
++    The vLLM inference path should prefer load-time weight merging via
++    :func:`merge_rotation_into_weight_loader` to avoid runtime rotation FLOPs.
+     """
+ 
+     def __init__(
+@@ -61,3 +65,89 @@ class RotationTransform(nn.Module):
+ 
+     def extra_repr(self) -> str:
+         return f"D_shape={tuple(self.D.shape)}, inv_D_shape={tuple(self.inv_D.shape)}"
++
++
++def find_rotation_matrix_path(
++    calibration_path: str,
++    layer_idx: int,
++    proj_name: str,
++) -> str | None:
++    """Return the La RoSA rotation matrix path for a layer/projection."""
++    rotation_dir = os.path.join(
++        calibration_path,
++        f"layers.{layer_idx}.{proj_name}",
++    )
++    for filename in ("D.pt", "Q.pt", "rotation.pt"):
++        path = os.path.join(rotation_dir, filename)
++        if os.path.exists(path):
++            return path
++    return None
++
++
++def load_rotation_matrix(
++    path: str,
++    device: torch.device | str = "cpu",
++) -> torch.Tensor:
++    """Load a square offline La RoSA rotation matrix."""
++    rotation = torch.load(path, map_location=device, weights_only=True)
++    if not isinstance(rotation, torch.Tensor):
++        raise TypeError(f"Rotation matrix at {path} is not a torch.Tensor")
++    if rotation.dim() != 2 or rotation.shape[0] != rotation.shape[1]:
++        raise ValueError(
++            "La RoSA rotation matrix must be square, got "
++            f"shape={tuple(rotation.shape)} from {path}"
++        )
++    return rotation
++
++
++def merge_rotation_into_weight(
++    weight: torch.Tensor,
++    rotation: torch.Tensor,
++) -> torch.Tensor:
++    """Right-multiply a linear weight by a La RoSA rotation matrix.
++
++    vLLM linear weights are stored as ``[out_features, in_features]`` and
++    applied as ``x @ weight.T``. Merging ``Q`` therefore uses ``W <- W @ Q``.
++    """
++    if weight.dim() != 2:
++        return weight
++
++    input_size = weight.shape[-1]
++    if rotation.shape != (input_size, input_size):
++        raise ValueError(
++            "La RoSA rotation shape mismatch: "
++            f"weight input size={input_size}, rotation shape={tuple(rotation.shape)}"
++        )
++
++    compute_dtype = torch.float32 if weight.device.type == "cpu" else weight.dtype
++    rotated_weight = torch.matmul(
++        weight.to(dtype=compute_dtype),
++        rotation.to(device=weight.device, dtype=compute_dtype),
++    )
++    return rotated_weight.to(dtype=weight.dtype)
++
++
++def merge_rotation_into_weight_loader(
++    linear_layer: nn.Module,
++    rotation: torch.Tensor,
++    *,
++    proj_name: str,
++) -> bool:
++    """Wrap a vLLM linear layer's weight loader to merge rotation at load time."""
++    weight = getattr(linear_layer, "weight", None)
++    if weight is None or not hasattr(weight, "weight_loader"):
++        return False
++
++    if getattr(weight, "_larosa_rotation_merged", False):
++        return False
++
++    original_loader: Callable = weight.weight_loader
++
++    def weight_loader(param, loaded_weight, *args, **kwargs):
++        merged_weight = merge_rotation_into_weight(loaded_weight, rotation)
++        return original_loader(param, merged_weight, *args, **kwargs)
++
++    weight.weight_loader = weight_loader
++    weight._larosa_rotation_merged = True
++    logger.debug("Merged La RoSA rotation into loader for %s", proj_name)
++    return True
+diff --git a/vllm/sparsity/utils.py b/vllm/sparsity/utils.py
+index eeb4581bdd2..255f4d71bde 100644
+--- a/vllm/sparsity/utils.py
++++ b/vllm/sparsity/utils.py
+@@ -10,6 +10,7 @@ import torch
+ 
+ from vllm.logger import init_logger
+ from vllm.model_executor.model_loader.weight_utils import (
++    DisabledTqdm,
+     get_lock,
+     maybe_download_from_modelscope,
+ )
+@@ -123,7 +124,6 @@ def get_activation_sparsity_config(
+     """
+     import huggingface_hub
+     from huggingface_hub import snapshot_download
+-    from huggingface_hub.utils import DisabledTqdm
+ 
+     model_name_or_path = getattr(model_config, "model", None)
+     if model_name_or_path is None:
+-- 
+2.53.0.windows.3
+

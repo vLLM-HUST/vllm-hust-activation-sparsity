@@ -1,0 +1,153 @@
+From 1a6023b93a5148e6968af6c9d11eb532edffd28f Mon Sep 17 00:00:00 2001
+From: Seas0 <season1277@outlook.com>
+Date: Thu, 16 Jul 2026 18:18:34 +0800
+Subject: [PATCH] feat: enable bf16 Ascend sparse dispatch
+
+---
+ tests/sparsity/test_distribution.py  | 30 ++++++++++++++++++++++++++++
+ vllm/sparsity/distribution.py        | 19 +++++++++---------
+ vllm/sparsity/kernels/sparse_gemv.py | 15 ++++++++++----
+ 3 files changed, 50 insertions(+), 14 deletions(-)
+
+diff --git a/tests/sparsity/test_distribution.py b/tests/sparsity/test_distribution.py
+index 129ade0de0f..89e041a26ec 100644
+--- a/tests/sparsity/test_distribution.py
++++ b/tests/sparsity/test_distribution.py
+@@ -540,6 +540,23 @@ def test_dense_fallback_uses_identity_for_near_zero_static_threshold(monkeypatch
+     assert sparsify.apply_dense_fallback(x) is x
+ 
+ 
++def test_dense_fallback_static_threshold_compiles_fullgraph(monkeypatch):
++    monkeypatch.delenv("VLLM_SPARSE_GEMV_MIN_STATIC_THRESHOLD", raising=False)
++    sparsify = SparsifyFn(
++        torch.tensor(0.5),
++        apply_all_tokens=True,
++        use_sparse_gemv=True,
++        expected_sparsity=0.9,
++    )
++    x = torch.randn(2, 8)
++
++    compiled = torch.compile(
++        sparsify.apply_dense_fallback, backend="eager", fullgraph=True
++    )
++
++    assert torch.equal(compiled(x), sparsify(x))
++
++
+ def test_sparse_linear_auto_policy_requires_expected_sparsity(monkeypatch):
+     monkeypatch.delenv("VLLM_SPARSE_GEMV_LINEAR_POLICY", raising=False)
+     monkeypatch.delenv("VLLM_SPARSE_GEMV_MIN_SPARSITY", raising=False)
+@@ -740,6 +757,19 @@ def test_sparse_gemv_marker_records_tensor_metadata(tmp_path, monkeypatch):
+     assert records[1]["active_sparsity_mean"] == 0.5
+ 
+ 
++@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
++def test_sparse_backend_accepts_matching_low_precision_dtype(dtype):
++    from vllm.sparsity.kernels.sparse_gemv import _same_supported_sparse_dtype
++
++    x = torch.empty(1, 4, dtype=dtype)
++
++    assert _same_supported_sparse_dtype(x, torch.empty(4, 3, dtype=dtype))
++    assert not _same_supported_sparse_dtype(
++        x,
++        torch.empty(4, 3, dtype=torch.float32),
++    )
++
++
+ def test_ascend_direct_t_fast_path_marker_records_metadata(tmp_path, monkeypatch):
+     from vllm.sparsity.kernels.sparse_gemv import (
+         _record_ascend_sparse_linear_marker,
+diff --git a/vllm/sparsity/distribution.py b/vllm/sparsity/distribution.py
+index 2f51f82f675..959f69ffd45 100644
+--- a/vllm/sparsity/distribution.py
++++ b/vllm/sparsity/distribution.py
+@@ -119,6 +119,14 @@ class SparsifyFn(nn.Module):
+         self.prefill_sparsify = prefill_sparsify
+         self.use_sparse_gemv = use_sparse_gemv
+         self.expected_sparsity = expected_sparsity
++        # Dynamo cannot guard on Tensor.item() inside a compiled forward. The
++        # calibration threshold is immutable, so cache its scalar value here.
++        try:
++            self._sparse_linear_static_threshold_abs_max = float(
++                threshold.detach().to(dtype=torch.float32).abs().max().item()
++            )
++        except Exception:
++            self._sparse_linear_static_threshold_abs_max = float("inf")
+ 
+     def _cached_tensor_to(
+         self,
+@@ -584,16 +592,7 @@ class SparsifyFn(nn.Module):
+         if min_threshold <= 0.0:
+             return True
+ 
+-        cached = getattr(self, "_sparse_linear_static_threshold_abs_max", None)
+-        if cached is None:
+-            try:
+-                cached = float(
+-                    threshold.detach().to(dtype=torch.float32).abs().max().item()
+-                )
+-            except Exception:
+-                return True
+-            self._sparse_linear_static_threshold_abs_max = cached
+-        return cached > min_threshold
++        return self._sparse_linear_static_threshold_abs_max > min_threshold
+ 
+     def _sparse_linear_min_static_threshold(self) -> float:
+         value = os.environ.get("VLLM_SPARSE_GEMV_MIN_STATIC_THRESHOLD")
+diff --git a/vllm/sparsity/kernels/sparse_gemv.py b/vllm/sparsity/kernels/sparse_gemv.py
+index 291e68fe0fb..d148bb920c1 100644
+--- a/vllm/sparsity/kernels/sparse_gemv.py
++++ b/vllm/sparsity/kernels/sparse_gemv.py
+@@ -245,6 +245,13 @@ def _is_npu_tensor(tensor: torch.Tensor) -> bool:
+     return getattr(getattr(tensor, "device", None), "type", None) == "npu"
+ 
+ 
++def _same_supported_sparse_dtype(
++    x: torch.Tensor,
++    weight: torch.Tensor,
++) -> bool:
++    return x.dtype in (torch.float16, torch.bfloat16) and weight.dtype == x.dtype
++
++
+ def _threshold_numel_is_supported(
+     threshold: torch.Tensor,
+     x: torch.Tensor,
+@@ -361,7 +368,7 @@ def _try_ascend_direct_t_fast_path(
+         return None
+     if not _is_npu_tensor(x):
+         return None
+-    if x.dtype != torch.float16 or weight_t.dtype != torch.float16:
++    if not _same_supported_sparse_dtype(x, weight_t):
+         return None
+     if x.dim() != 2 or weight_t.dim() != 2:
+         return None
+@@ -404,7 +411,7 @@ def _try_ascend_silu_and_mul_direct_t_fast_path(
+         return None
+     if not _is_npu_tensor(x):
+         return None
+-    if x.dtype != torch.float16 or weight_t.dtype != torch.float16:
++    if not _same_supported_sparse_dtype(x, weight_t):
+         return None
+     if x.dim() != 2 or weight_t.dim() != 2:
+         return None
+@@ -562,7 +569,7 @@ def sparse_gemv_topk_matmul_silu_impl(
+     """Apply La RoSA top-k sparse gate/up via selected-weight matmul on NPU."""
+     if not _is_npu_tensor(x):
+         return None
+-    if x.dtype != torch.float16 or weight_t.dtype != torch.float16:
++    if not _same_supported_sparse_dtype(x, weight_t):
+         return None
+     if x.dim() != 2 or x.shape[0] != 1:
+         return None
+@@ -612,7 +619,7 @@ def sparse_gemv_direct_t_cached_impl(
+     """Fastest cached-plan path for already validated Ascend direct-T calls."""
+     if not _is_npu_tensor(x):
+         return None
+-    if x.dtype != torch.float16 or weight_t.dtype != torch.float16:
++    if not _same_supported_sparse_dtype(x, weight_t):
+         return None
+     if threshold.dtype != torch.float32 or threshold.device != x.device:
+         return None
+-- 
+2.53.0.windows.3
+

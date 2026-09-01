@@ -1,0 +1,531 @@
+From b82fff70dfcad3c54ddc822d50845e2b2c7f6443 Mon Sep 17 00:00:00 2001
+From: Seas0 <season1277@outlook.com>
+Date: Wed, 3 Jun 2026 09:24:36 +0800
+Subject: [PATCH] [sparsity] Align La RoSA runtime sparsification
+
+Co-authored-by: OpenAI Codex <codex@openai.com>
+---
+ tests/sparsity/test_distribution.py | 47 +++++++++++++-
+ tests/sparsity/test_layers.py       | 36 ++++++++---
+ tests/sparsity/test_rotation.py     | 13 ++++
+ vllm/model_executor/models/llama.py | 13 ----
+ vllm/model_executor/models/qwen2.py | 13 ----
+ vllm/sparsity/__init__.py           |  9 ++-
+ vllm/sparsity/config.py             |  2 +-
+ vllm/sparsity/distribution.py       | 95 ++++++++++++++++++++++++++++-
+ vllm/sparsity/layers.py             | 63 ++++++++++++++++++-
+ vllm/sparsity/rotation.py           | 30 ++++++---
+ 10 files changed, 271 insertions(+), 50 deletions(-)
+
+diff --git a/tests/sparsity/test_distribution.py b/tests/sparsity/test_distribution.py
+index d837de7f6fc..c324c5bfd7b 100644
+--- a/tests/sparsity/test_distribution.py
++++ b/tests/sparsity/test_distribution.py
+@@ -5,7 +5,12 @@ from types import SimpleNamespace
+ import torch
+ 
+ from vllm.forward_context import ForwardContext, override_forward_context
+-from vllm.sparsity.distribution import Distribution, SparsifyFn
++from vllm.sparsity.distribution import (
++    Distribution,
++    LaRosaSparsifyFn,
++    SparsifyFn,
++    larosa_topk,
++)
+ 
+ 
+ def test_distribution_icdf():
+@@ -141,3 +146,43 @@ def test_sparsify_fn_prefill_none_is_decode_only():
+     decode_x = torch.ones(1, 1, 3)
+     assert torch.allclose(sparsify(prefill_x), prefill_x)
+     assert sparsify(decode_x).abs().max() == 0.0
++
++
++def test_larosa_topk_matches_official_rule():
++    x = torch.tensor([[1.0, -4.0, 3.0, 2.0], [0.1, -0.2, 0.3, -0.4]])
++
++    out = larosa_topk(x, sparsity_level=0.5)
++
++    expected = torch.tensor([[0.0, -4.0, 3.0, 0.0], [0.0, 0.0, 0.3, -0.4]])
++    assert torch.allclose(out, expected)
++
++
++def test_larosa_sparsify_rotates_topk_and_unrotates():
++    rotation = torch.tensor(
++        [
++            [0.0, 1.0, 0.0, 0.0],
++            [1.0, 0.0, 0.0, 0.0],
++            [0.0, 0.0, 1.0, 0.0],
++            [0.0, 0.0, 0.0, 1.0],
++        ]
++    )
++    sparsify = LaRosaSparsifyFn(
++        sparsity_level=0.5,
++        rotation=rotation,
++        rotate_input=True,
++    )
++    x = torch.tensor([[1.0, -4.0, 3.0, 2.0]])
++
++    out = sparsify(x)
++
++    expected = larosa_topk(x.double() @ rotation.double(), 0.5) @ rotation.double().t()
++    assert torch.allclose(out, expected.to(dtype=x.dtype))
++
++
++def test_larosa_sparsify_second_site_topk_direct():
++    sparsify = LaRosaSparsifyFn(sparsity_level=0.5, rotate_input=False)
++    x = torch.tensor([[1.0, -4.0, 3.0, 2.0]])
++
++    out = sparsify(x)
++
++    assert torch.allclose(out, larosa_topk(x, 0.5))
+diff --git a/tests/sparsity/test_layers.py b/tests/sparsity/test_layers.py
+index 45f138807ea..9098c3f0c0d 100644
+--- a/tests/sparsity/test_layers.py
++++ b/tests/sparsity/test_layers.py
+@@ -7,6 +7,7 @@ import pytest
+ import torch
+ 
+ from vllm.sparsity.config import ActivationSparsityConfig
++from vllm.sparsity.distribution import LaRosaSparsifyFn
+ from vllm.sparsity.layers import build_sparsifier
+ 
+ 
+@@ -63,28 +64,43 @@ def test_build_sparsifier_prefill_half_default():
+ 
+ def test_build_sparsifier_larosa():
+     with tempfile.TemporaryDirectory() as tmpdir:
+-        # Threshold
+-        torch.save(
+-            torch.tensor(0.5),
+-            os.path.join(tmpdir, "layers.2.self_attn.qkv.threshold.pt"),
+-        )
+-        # Rotation matrices are load-time weight artifacts, not SparsifyFn modules.
+-        os.makedirs(os.path.join(tmpdir, "layers.2.self_attn.qkv"))
++        os.makedirs(os.path.join(tmpdir, "histograms", "layer-2", "self_attn"))
+         hidden = 16
+         d = torch.eye(hidden)
+-        torch.save(d, os.path.join(tmpdir, "layers.2.self_attn.qkv", "D.pt"))
++        torch.save(
++            d,
++            os.path.join(tmpdir, "histograms", "layer-2", "self_attn", "D.pt"),
++        )
+ 
+         cfg = ActivationSparsityConfig(
+             enable=True,
+             method="larosa",
+             calibration_path=tmpdir,
+-            apply_all_tokens=True,
++            uniform_sparsity=0.5,
+         )
+         sparsifier = build_sparsifier(cfg, layer_idx=2, proj_name="self_attn.qkv")
+ 
+         assert sparsifier is not None
++        assert isinstance(sparsifier, LaRosaSparsifyFn)
++        assert sparsifier.rotate_input is True
++        assert sparsifier.sparsity_level == 0.4
+         x = torch.randn(4, hidden)
+         out = sparsifier(x)
+         assert out.shape == x.shape
+-        # SparsifyFn itself remains a plain mask; rotations are merged into weights.
+         assert (out == 0).any()
++
++
++def test_build_sparsifier_larosa_second_site_no_rotation_required():
++    with tempfile.TemporaryDirectory() as tmpdir:
++        cfg = ActivationSparsityConfig(
++            enable=True,
++            method="larosa",
++            calibration_path=tmpdir,
++            uniform_sparsity=0.5,
++        )
++
++        sparsifier = build_sparsifier(cfg, layer_idx=2, proj_name="mlp.down")
++
++        assert isinstance(sparsifier, LaRosaSparsifyFn)
++        assert sparsifier.rotate_input is False
++        assert sparsifier.sparsity_level == 0.6
+diff --git a/tests/sparsity/test_rotation.py b/tests/sparsity/test_rotation.py
+index 700e5cd1c3c..da222ded353 100644
+--- a/tests/sparsity/test_rotation.py
++++ b/tests/sparsity/test_rotation.py
+@@ -4,6 +4,7 @@ import torch
+ 
+ from vllm.sparsity.rotation import (
+     RotationTransform,
++    find_rotation_matrix_path,
+     merge_rotation_into_weight,
+     merge_rotation_into_weight_loader,
+ )
+@@ -65,3 +66,15 @@ def test_merge_rotation_into_weight_loader():
+     linear.weight.weight_loader(linear.weight, loaded_weight)
+ 
+     assert torch.allclose(linear.weight.loaded, loaded_weight @ rotation)
++
++
++def test_find_rotation_matrix_path_accepts_official_larosa_layout(tmp_path):
++    rotation_dir = tmp_path / "histograms" / "layer-3" / "self_attn"
++    rotation_dir.mkdir(parents=True)
++    rotation_path = rotation_dir / "D.pt"
++    torch.save(torch.eye(4), rotation_path)
++
++    assert (
++        find_rotation_matrix_path(str(tmp_path), 3, "mlp.gate_up")
++        == str(rotation_path)
++    )
+diff --git a/vllm/model_executor/models/llama.py b/vllm/model_executor/models/llama.py
+index 6c809ef8f70..a0e3df26484 100644
+--- a/vllm/model_executor/models/llama.py
++++ b/vllm/model_executor/models/llama.py
+@@ -56,7 +56,6 @@ from vllm.sequence import IntermediateTensors
+ from vllm.sparsity import (
+     ActivationSparsityConfig,
+     build_sparsifier,
+-    merge_larosa_rotation_into_linear,
+ )
+ from vllm.v1.attention.backend import AttentionType
+ 
+@@ -123,12 +122,6 @@ class LlamaMLP(nn.Module):
+             layer_idx = extract_layer_index(prefix)
+         except Exception:
+             layer_idx = 0
+-        merge_larosa_rotation_into_linear(
+-            sparsity_config, layer_idx, "mlp.gate_up", self.gate_up_proj
+-        )
+-        merge_larosa_rotation_into_linear(
+-            sparsity_config, layer_idx, "mlp.down", self.down_proj
+-        )
+         self.sparsify_gate_up = (
+             build_sparsifier(sparsity_config, layer_idx, "mlp.gate_up")
+             if sparsity_config is not None
+@@ -252,12 +245,6 @@ class LlamaAttention(nn.Module):
+         )
+ 
+         # TEAL / La RoSA injection points
+-        merge_larosa_rotation_into_linear(
+-            sparsity_config, layer_idx, "self_attn.qkv", self.qkv_proj
+-        )
+-        merge_larosa_rotation_into_linear(
+-            sparsity_config, layer_idx, "self_attn.o", self.o_proj
+-        )
+         self.sparsify_qkv = (
+             build_sparsifier(sparsity_config, layer_idx, "self_attn.qkv")
+             if sparsity_config is not None
+diff --git a/vllm/model_executor/models/qwen2.py b/vllm/model_executor/models/qwen2.py
+index 05d48059b36..5e7853ed808 100644
+--- a/vllm/model_executor/models/qwen2.py
++++ b/vllm/model_executor/models/qwen2.py
+@@ -58,7 +58,6 @@ from vllm.sequence import IntermediateTensors
+ from vllm.sparsity import (
+     ActivationSparsityConfig,
+     build_sparsifier,
+-    merge_larosa_rotation_into_linear,
+ )
+ from vllm.transformers_utils.config import is_interleaved, set_default_rope_theta
+ from vllm.v1.attention.backend import AttentionType
+@@ -117,12 +116,6 @@ class Qwen2MLP(nn.Module):
+             layer_idx = extract_layer_index(prefix)
+         except Exception:
+             layer_idx = 0
+-        merge_larosa_rotation_into_linear(
+-            sparsity_config, layer_idx, "mlp.gate_up", self.gate_up_proj
+-        )
+-        merge_larosa_rotation_into_linear(
+-            sparsity_config, layer_idx, "mlp.down", self.down_proj
+-        )
+         self.sparsify_gate_up = (
+             build_sparsifier(sparsity_config, layer_idx, "mlp.gate_up")
+             if sparsity_config is not None
+@@ -236,12 +229,6 @@ class Qwen2Attention(nn.Module):
+         )
+ 
+         layer_idx = extract_layer_index(prefix)
+-        merge_larosa_rotation_into_linear(
+-            sparsity_config, layer_idx, "self_attn.qkv", self.qkv_proj
+-        )
+-        merge_larosa_rotation_into_linear(
+-            sparsity_config, layer_idx, "self_attn.o", self.o_proj
+-        )
+         self.sparsify_qkv = (
+             build_sparsifier(sparsity_config, layer_idx, "self_attn.qkv")
+             if sparsity_config is not None
+diff --git a/vllm/sparsity/__init__.py b/vllm/sparsity/__init__.py
+index af16169c9e8..e67fc7464e9 100644
+--- a/vllm/sparsity/__init__.py
++++ b/vllm/sparsity/__init__.py
+@@ -2,7 +2,12 @@
+ """Activation sparsity support for vLLM (TEAL / La RoSA)."""
+ 
+ from vllm.sparsity.config import ActivationSparsityConfig
+-from vllm.sparsity.distribution import Distribution, SparsifyFn
++from vllm.sparsity.distribution import (
++    Distribution,
++    LaRosaSparsifyFn,
++    SparsifyFn,
++    larosa_topk,
++)
+ from vllm.sparsity.rotation import RotationTransform
+ 
+ __all__ = [
+@@ -10,6 +15,8 @@ __all__ = [
+     "build_sparsifier",
+     "Distribution",
+     "get_activation_sparsity_config",
++    "LaRosaSparsifyFn",
++    "larosa_topk",
+     "load_threshold",
+     "merge_larosa_rotation_into_linear",
+     "RotationTransform",
+diff --git a/vllm/sparsity/config.py b/vllm/sparsity/config.py
+index 6860348d3fb..54f3ab508e9 100644
+--- a/vllm/sparsity/config.py
++++ b/vllm/sparsity/config.py
+@@ -37,7 +37,7 @@ class ActivationSparsityConfig:
+     calibration_path: str | None = None
+     """Directory containing calibration artifacts:
+     ``histograms.pt``, per-layer ``threshold.pt``, and (for La RoSA)
+-    ``D.pt`` / ``inv_D.pt``."""
++    official ``histograms/layer-{idx}/self_attn/D.pt`` rotations."""
+ 
+     # Decode-only guard
+     decode_only: bool = False
+diff --git a/vllm/sparsity/distribution.py b/vllm/sparsity/distribution.py
+index 75b5b729c4b..bca116cc3a5 100644
+--- a/vllm/sparsity/distribution.py
++++ b/vllm/sparsity/distribution.py
+@@ -1,5 +1,5 @@
+ # SPDX-License-Identifier: Apache-2.0
+-"""TEAL distribution and sparsify function."""
++"""TEAL and La RoSA distribution/sparsify functions."""
+ 
+ import torch
+ from torch import nn
+@@ -289,3 +289,96 @@ class SparsifyFn(nn.Module):
+             f"apply_all_tokens={self.apply_all_tokens}, "
+             f"prefill_sparsify={self.prefill_sparsify}"
+         )
++
++
++def larosa_topk(x: torch.Tensor, sparsity_level: float) -> torch.Tensor:
++    """Apply La RoSA's per-token magnitude top-k sparsity on the last dim."""
++    if sparsity_level <= 0.0:
++        return x
++    if sparsity_level >= 1.0:
++        raise ValueError(
++            "La RoSA sparsity_level must be lower than 1.0, "
++            f"got {sparsity_level}."
++        )
++
++    keep = int((1.0 - sparsity_level) * x.shape[-1])
++    if keep < 1:
++        raise ValueError(
++            "La RoSA sparsity_level keeps fewer than one activation for "
++            f"hidden size {x.shape[-1]}: sparsity_level={sparsity_level}."
++        )
++
++    topk_values, _ = torch.topk(torch.abs(x), keep, dim=-1)
++    keep_threshold = topk_values[..., -1:]
++    return torch.where(torch.abs(x) >= keep_threshold, x, torch.zeros_like(x))
++
++
++class LaRosaSparsifyFn(SparsifyFn):
++    """La RoSA runtime sparsifier aligned with the official HF backend.
++
++    For the first hidden-state sparsification site (attention qkv input and
++    MLP gate/up input), La RoSA rotates activations by ``Q``, applies per-token
++    top-k sparsity, and rotates back by ``Q.T``. For the second site (attention
++    output and MLP intermediate), it applies top-k directly.
++    """
++
++    def __init__(
++        self,
++        sparsity_level: float,
++        rotation: torch.Tensor | None = None,
++        rotate_input: bool = False,
++        decode_only: bool = False,
++        apply_all_tokens: bool = True,
++        prefill_sparsify: str = "all",
++    ) -> None:
++        super().__init__(
++            threshold=torch.tensor(0.0),
++            decode_only=decode_only,
++            apply_all_tokens=apply_all_tokens,
++            prefill_sparsify=prefill_sparsify,
++        )
++        if rotate_input and rotation is None:
++            raise ValueError("La RoSA rotate_input=True requires a rotation matrix.")
++        if rotation is not None:
++            if rotation.dim() != 2 or rotation.shape[0] != rotation.shape[1]:
++                raise ValueError(
++                    "La RoSA rotation matrix must be square, got "
++                    f"shape={tuple(rotation.shape)}."
++                )
++            rotation = rotation.to(dtype=torch.float64)
++        self.sparsity_level = float(sparsity_level)
++        self.rotate_input = rotate_input
++        self.register_buffer("rotation", rotation)
++
++    def _apply_mask(self, x: torch.Tensor) -> torch.Tensor:
++        if self.sparsity_level <= 0.0:
++            return x
++
++        original_dtype = x.dtype
++        if not self.rotate_input:
++            return larosa_topk(x, self.sparsity_level)
++
++        if self.rotation is None:
++            raise ValueError("La RoSA rotation matrix is not initialized.")
++        if x.shape[-1] != self.rotation.shape[0]:
++            raise ValueError(
++                "La RoSA rotation hidden size mismatch: "
++                f"input hidden={x.shape[-1]}, rotation={tuple(self.rotation.shape)}."
++            )
++
++        rotation = self.rotation.to(device=x.device)
++        rotated_x = torch.matmul(x.to(dtype=torch.float64), rotation)
++        sparse_rotated_x = larosa_topk(rotated_x, self.sparsity_level)
++        unrotated_x = torch.matmul(sparse_rotated_x, rotation.t())
++        return unrotated_x.to(dtype=original_dtype)
++
++    def extra_repr(self) -> str:
++        rotation_shape = None if self.rotation is None else tuple(self.rotation.shape)
++        return (
++            f"sparsity_level={self.sparsity_level:.4f}, "
++            f"rotate_input={self.rotate_input}, "
++            f"rotation_shape={rotation_shape}, "
++            f"decode_only={self.decode_only}, "
++            f"apply_all_tokens={self.apply_all_tokens}, "
++            f"prefill_sparsify={self.prefill_sparsify}"
++        )
+diff --git a/vllm/sparsity/layers.py b/vllm/sparsity/layers.py
+index 668d1ff4854..2a798059244 100644
+--- a/vllm/sparsity/layers.py
++++ b/vllm/sparsity/layers.py
+@@ -6,7 +6,7 @@ from torch import nn
+ 
+ from vllm.logger import init_logger
+ from vllm.sparsity.config import ActivationSparsityConfig
+-from vllm.sparsity.distribution import SparsifyFn
++from vllm.sparsity.distribution import LaRosaSparsifyFn, SparsifyFn
+ from vllm.sparsity.rotation import (
+     find_rotation_matrix_path,
+     load_rotation_matrix,
+@@ -44,7 +44,15 @@ def build_sparsifier(
+         )
+         return None
+ 
+-    # Load pre-computed threshold for this layer/proj
++    if sparsity_config.method == "larosa":
++        return _build_larosa_sparsifier(
++            sparsity_config,
++            layer_idx,
++            proj_name,
++            device,
++        )
++
++    # Load pre-computed TEAL threshold for this layer/proj
+     threshold = load_threshold(
+         sparsity_config.calibration_path,
+         layer_idx,
+@@ -62,6 +70,57 @@ def build_sparsifier(
+     return sparsify_fn
+ 
+ 
++def _build_larosa_sparsifier(
++    sparsity_config: ActivationSparsityConfig,
++    layer_idx: int,
++    proj_name: str,
++    device: torch.device | str = "cpu",
++) -> LaRosaSparsifyFn | None:
++    """Build La RoSA's official runtime top-k sparsifier for a projection."""
++    first_site_projs = {"self_attn.qkv", "mlp.gate_up"}
++    second_site_projs = {"self_attn.o", "mlp.down"}
++
++    if proj_name in first_site_projs:
++        sparse_level = sparsity_config.uniform_sparsity * 0.8
++        rotation_path = find_rotation_matrix_path(
++            sparsity_config.calibration_path,
++            layer_idx,
++            proj_name,
++        )
++        if rotation_path is None:
++            raise FileNotFoundError(
++                "La RoSA rotation matrix not found for "
++                f"layer {layer_idx}, projection '{proj_name}'. Expected "
++                f"{sparsity_config.calibration_path}/histograms/"
++                f"layer-{layer_idx}/self_attn/D.pt or "
++                f"{sparsity_config.calibration_path}/layers."
++                f"{layer_idx}.{proj_name}/D.pt."
++            )
++        rotation = load_rotation_matrix(rotation_path, device=device)
++        return LaRosaSparsifyFn(
++            sparsity_level=sparse_level,
++            rotation=rotation,
++            rotate_input=True,
++            decode_only=sparsity_config.decode_only,
++            apply_all_tokens=True,
++            prefill_sparsify="all",
++        )
++
++    if proj_name in second_site_projs:
++        sparse_level = sparsity_config.uniform_sparsity * 1.2
++        return LaRosaSparsifyFn(
++            sparsity_level=sparse_level,
++            rotation=None,
++            rotate_input=False,
++            decode_only=sparsity_config.decode_only,
++            apply_all_tokens=True,
++            prefill_sparsify="all",
++        )
++
++    logger.warning_once("Unsupported La RoSA projection %s; skipping.", proj_name)
++    return None
++
++
+ def merge_larosa_rotation_into_linear(
+     sparsity_config: ActivationSparsityConfig | None,
+     layer_idx: int,
+diff --git a/vllm/sparsity/rotation.py b/vllm/sparsity/rotation.py
+index a4054f0eae9..fb502f31298 100644
+--- a/vllm/sparsity/rotation.py
++++ b/vllm/sparsity/rotation.py
+@@ -73,14 +73,28 @@ def find_rotation_matrix_path(
+     proj_name: str,
+ ) -> str | None:
+     """Return the La RoSA rotation matrix path for a layer/projection."""
+-    rotation_dir = os.path.join(
+-        calibration_path,
+-        f"layers.{layer_idx}.{proj_name}",
+-    )
+-    for filename in ("D.pt", "Q.pt", "rotation.pt"):
+-        path = os.path.join(rotation_dir, filename)
+-        if os.path.exists(path):
+-            return path
++    candidate_dirs = [
++        os.path.join(calibration_path, f"layers.{layer_idx}.{proj_name}"),
++    ]
++
++    # Official La RoSA inference loads one per-layer Q from
++    # {Q_path}/histograms/layer-{idx}/self_attn/D.pt and reuses it for both
++    # attention and MLP first-site sparsification.
++    if proj_name in {"self_attn.qkv", "mlp.gate_up"}:
++        candidate_dirs.extend(
++            [
++                os.path.join(
++                    calibration_path, "histograms", f"layer-{layer_idx}", "self_attn"
++                ),
++                os.path.join(calibration_path, f"layer-{layer_idx}", "self_attn"),
++            ]
++        )
++
++    for rotation_dir in candidate_dirs:
++        for filename in ("D.pt", "Q.pt", "rotation.pt"):
++            path = os.path.join(rotation_dir, filename)
++            if os.path.exists(path):
++                return path
+     return None
+ 
+ 
+-- 
+2.53.0.windows.3
+

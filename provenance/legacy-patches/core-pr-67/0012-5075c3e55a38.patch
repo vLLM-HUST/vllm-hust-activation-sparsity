@@ -1,0 +1,810 @@
+From 5075c3e55a386bdb06fdf387e6d55b9c8a4db945 Mon Sep 17 00:00:00 2001
+From: Seas0 <season1277@outlook.com>
+Date: Fri, 19 Jun 2026 16:37:22 +0800
+Subject: [PATCH] perf: gate sparse gemv by expected sparsity
+
+---
+ scripts/bench_sparse_kernel_throughput.py | 51 +++++++++++++
+ scripts/eval_larosa_ppl_alignment.py      | 62 ++++++++++++++-
+ scripts/eval_teal_ppl_alignment.py        | 76 ++++++++++++++++--
+ tests/sparsity/test_distribution.py       | 87 ++++++++++++++++++++-
+ tests/sparsity/test_layers.py             |  8 +-
+ vllm/model_executor/models/llama.py       | 10 ++-
+ vllm/model_executor/models/qwen2.py       | 10 ++-
+ vllm/sparsity/distribution.py             | 93 +++++++++++++++++++----
+ vllm/sparsity/layers.py                   |  3 +
+ 9 files changed, 368 insertions(+), 32 deletions(-)
+
+diff --git a/scripts/bench_sparse_kernel_throughput.py b/scripts/bench_sparse_kernel_throughput.py
+index a0470af06df..a3a8e9d0f3a 100644
+--- a/scripts/bench_sparse_kernel_throughput.py
++++ b/scripts/bench_sparse_kernel_throughput.py
+@@ -41,6 +41,26 @@ def parse_args() -> argparse.Namespace:
+     parser.add_argument("--enforce-eager", action="store_true")
+     parser.add_argument("--shutdown-timeout", type=int, default=60)
+     parser.add_argument("--vllm-prefill-sparsify", default="none")
++    parser.add_argument(
++        "--sparse-gemv-dense-fallback-policy",
++        choices=["mask", "identity"],
++        default="mask",
++        help=(
++            "Policy for projections rejected by the sparse GEMV kernel policy. "
++            "'mask' preserves TEAL/La RoSA dense fallback semantics; 'identity' "
++            "leaves all-row rejected projections dense for kernel-only "
++            "throughput probes."
++        ),
++    )
++    parser.add_argument(
++        "--sparse-gemv-min-sparsity",
++        type=float,
++        default=None,
++        help=(
++            "Minimum expected sparsity for auto sparse GEMV dispatch. If unset, "
++            "the runtime default is used."
++        ),
++    )
+     parser.add_argument("--allow-sparse-gemv-fallback", action="store_true")
+     parser.add_argument(
+         "--no-require-sparse-invocations",
+@@ -259,6 +279,11 @@ def main() -> int:
+         raise ValueError("--warmup-prompts must be in [0, num-prompts]")
+     if args.sparsity < 0.0 or args.sparsity >= 1.0:
+         raise ValueError("--sparsity must be in [0, 1)")
++    if (
++        args.sparse_gemv_min_sparsity is not None
++        and not 0.0 <= args.sparse_gemv_min_sparsity <= 1.0
++    ):
++        raise ValueError("--sparse-gemv-min-sparsity must be in [0, 1]")
+     if args.method == "larosa" and args.sparsity * 1.2 >= 1.0:
+         raise ValueError("La RoSA h2 sparsity is sparsity * 1.2 and must be < 1")
+ 
+@@ -276,9 +301,21 @@ def main() -> int:
+     previous_ascend_marker_path = os.environ.get(
+         "VLLM_ASCEND_SPARSE_LINEAR_MARKER_PATH"
+     )
++    previous_dense_fallback_policy = os.environ.get(
++        "VLLM_SPARSE_GEMV_DENSE_FALLBACK_POLICY"
++    )
++    previous_min_sparsity = os.environ.get("VLLM_SPARSE_GEMV_MIN_SPARSITY")
+     os.environ["VLLM_SPARSE_GEMV_REQUIRE_KERNEL"] = (
+         "0" if args.allow_sparse_gemv_fallback else "1"
+     )
++    os.environ["VLLM_SPARSE_GEMV_DENSE_FALLBACK_POLICY"] = (
++        args.sparse_gemv_dense_fallback_policy
++    )
++    if args.sparse_gemv_min_sparsity is not None:
++        os.environ["VLLM_SPARSE_GEMV_MIN_SPARSITY"] = str(
++            args.sparse_gemv_min_sparsity
++        )
++    active_min_sparsity = os.environ.get("VLLM_SPARSE_GEMV_MIN_SPARSITY", "0.70")
+     marker_tmpdir = tempfile.TemporaryDirectory(prefix="vllm_sparse_gemv_")
+     marker_path = Path(marker_tmpdir.name) / "invocations.jsonl"
+     ascend_marker_path = Path(marker_tmpdir.name) / "ascend_custom_ops.jsonl"
+@@ -302,6 +339,16 @@ def main() -> int:
+             os.environ["VLLM_ASCEND_SPARSE_LINEAR_MARKER_PATH"] = (
+                 previous_ascend_marker_path
+             )
++        if previous_dense_fallback_policy is None:
++            os.environ.pop("VLLM_SPARSE_GEMV_DENSE_FALLBACK_POLICY", None)
++        else:
++            os.environ["VLLM_SPARSE_GEMV_DENSE_FALLBACK_POLICY"] = (
++                previous_dense_fallback_policy
++            )
++        if previous_min_sparsity is None:
++            os.environ.pop("VLLM_SPARSE_GEMV_MIN_SPARSITY", None)
++        else:
++            os.environ["VLLM_SPARSE_GEMV_MIN_SPARSITY"] = previous_min_sparsity
+ 
+     sparse_invocations_current_process = get_sparse_invocation_counter()
+     sparse_marker_records = read_marker_records(marker_path)
+@@ -426,6 +473,10 @@ def main() -> int:
+         "num_prompts": args.num_prompts,
+         "dtype": args.dtype,
+         "sparse_linear_policy": os.environ.get("VLLM_SPARSE_GEMV_LINEAR_POLICY"),
++        "sparse_gemv_dense_fallback_policy": (
++            args.sparse_gemv_dense_fallback_policy
++        ),
++        "sparse_gemv_min_sparsity": active_min_sparsity,
+         "require_sparse_gemv_kernel": not args.allow_sparse_gemv_fallback,
+         "dense": dense,
+         "sparse": sparse,
+diff --git a/scripts/eval_larosa_ppl_alignment.py b/scripts/eval_larosa_ppl_alignment.py
+index 073b824b007..045c03a1d01 100644
+--- a/scripts/eval_larosa_ppl_alignment.py
++++ b/scripts/eval_larosa_ppl_alignment.py
+@@ -135,6 +135,26 @@ def parse_args() -> argparse.Namespace:
+             "kernel-backed evidence runs."
+         ),
+     )
++    backends.add_argument(
++        "--vllm-sparse-gemv-dense-fallback-policy",
++        choices=["mask", "identity"],
++        default="mask",
++        help=(
++            "Policy for projections rejected by the sparse GEMV kernel policy. "
++            "'mask' preserves La RoSA dense fallback semantics; 'identity' "
++            "leaves all-row rejected projections dense for kernel-only PPL "
++            "probes."
++        ),
++    )
++    backends.add_argument(
++        "--vllm-sparse-gemv-min-sparsity",
++        type=float,
++        default=None,
++        help=(
++            "Minimum expected sparsity for auto sparse GEMV dispatch. If unset, "
++            "the runtime default is used."
++        ),
++    )
+ 
+     runtime = parser.add_argument_group("runtime")
+     runtime.add_argument(
+@@ -470,12 +490,28 @@ def run_vllm_reference(
+     previous_ascend_marker_path = os.environ.get(
+         "VLLM_ASCEND_SPARSE_LINEAR_MARKER_PATH"
+     )
++    previous_dense_fallback_policy = os.environ.get(
++        "VLLM_SPARSE_GEMV_DENSE_FALLBACK_POLICY"
++    )
++    previous_min_sparsity = os.environ.get("VLLM_SPARSE_GEMV_MIN_SPARSITY")
+     marker_tmpdir: tempfile.TemporaryDirectory[str] | None = None
+     marker_summary: dict[str, Any] | None = None
++    active_min_sparsity: str | None = None
+     if args.vllm_use_sparse_gemv:
+         os.environ["VLLM_SPARSE_GEMV_REQUIRE_KERNEL"] = (
+             "0" if args.vllm_allow_sparse_gemv_fallback else "1"
+         )
++        os.environ["VLLM_SPARSE_GEMV_DENSE_FALLBACK_POLICY"] = (
++            args.vllm_sparse_gemv_dense_fallback_policy
++        )
++        if args.vllm_sparse_gemv_min_sparsity is not None:
++            os.environ["VLLM_SPARSE_GEMV_MIN_SPARSITY"] = str(
++                args.vllm_sparse_gemv_min_sparsity
++            )
++        active_min_sparsity = os.environ.get(
++            "VLLM_SPARSE_GEMV_MIN_SPARSITY",
++            "0.70",
++        )
+         marker_tmpdir = tempfile.TemporaryDirectory(prefix="vllm_ppl_sparse_gemv_")
+         sparse_marker_path = Path(marker_tmpdir.name) / "invocations.jsonl"
+         ascend_marker_path = Path(marker_tmpdir.name) / "ascend_custom_ops.jsonl"
+@@ -516,13 +552,26 @@ def run_vllm_reference(
+             os.environ["VLLM_ASCEND_SPARSE_LINEAR_MARKER_PATH"] = (
+                 previous_ascend_marker_path
+             )
++        if previous_dense_fallback_policy is None:
++            os.environ.pop("VLLM_SPARSE_GEMV_DENSE_FALLBACK_POLICY", None)
++        else:
++            os.environ["VLLM_SPARSE_GEMV_DENSE_FALLBACK_POLICY"] = (
++                previous_dense_fallback_policy
++            )
++        if previous_min_sparsity is None:
++            os.environ.pop("VLLM_SPARSE_GEMV_MIN_SPARSITY", None)
++        else:
++            os.environ["VLLM_SPARSE_GEMV_MIN_SPARSITY"] = previous_min_sparsity
+         if marker_tmpdir is not None:
+             marker_tmpdir.cleanup()
+ 
+     return BackendComparison(
+         backend=(
+             "vllm_larosa:official_topk:all_tokens:"
+-            f"use_sparse_gemv={args.vllm_use_sparse_gemv}"
++            f"use_sparse_gemv={args.vllm_use_sparse_gemv}:"
++            "sparse_gemv_dense_fallback="
++            f"{args.vllm_sparse_gemv_dense_fallback_policy}:"
++            f"sparse_gemv_min_sparsity={active_min_sparsity}"
+         ),
+         dense=dense,
+         sparse=sparse,
+@@ -541,6 +590,11 @@ def main() -> int:
+             "Official La RoSA h2 sparsity is sparsity * 1.2 and must be < 1. "
+             f"Got sparsity={args.sparsity}."
+         )
++    if (
++        args.vllm_sparse_gemv_min_sparsity is not None
++        and not 0.0 <= args.vllm_sparse_gemv_min_sparsity <= 1.0
++    ):
++        raise ValueError("--vllm-sparse-gemv-min-sparsity must be in [0, 1]")
+ 
+     config = get_model_config(args)
+     model_type = resolve_model_type(config)
+@@ -588,6 +642,12 @@ def main() -> int:
+                 "windows": len(windows),
+                 "hf_reference_impl": args.hf_reference_impl,
+                 "rotation_dtype": args.rotation_dtype,
++                "vllm_sparse_gemv_dense_fallback_policy": (
++                    args.vllm_sparse_gemv_dense_fallback_policy
++                ),
++                "vllm_sparse_gemv_min_sparsity": (
++                    args.vllm_sparse_gemv_min_sparsity
++                ),
+                 "calibration_path": str(args.calibration_path),
+             },
+             "hf": comparison_payload(hf_result),
+diff --git a/scripts/eval_teal_ppl_alignment.py b/scripts/eval_teal_ppl_alignment.py
+index 5643c9d8ae3..1edebd01051 100644
+--- a/scripts/eval_teal_ppl_alignment.py
++++ b/scripts/eval_teal_ppl_alignment.py
+@@ -217,6 +217,25 @@ def parse_args() -> argparse.Namespace:
+             "kernel-backed evidence runs."
+         ),
+     )
++    backends.add_argument(
++        "--vllm-sparse-gemv-dense-fallback-policy",
++        choices=["mask", "identity"],
++        default="mask",
++        help=(
++            "Policy for projections rejected by the sparse GEMV kernel policy. "
++            "'mask' preserves TEAL dense fallback semantics; 'identity' leaves "
++            "all-row rejected projections dense for kernel-only PPL probes."
++        ),
++    )
++    backends.add_argument(
++        "--vllm-sparse-gemv-min-sparsity",
++        type=float,
++        default=None,
++        help=(
++            "Minimum expected sparsity for auto sparse GEMV dispatch. If unset, "
++            "the runtime default is used."
++        ),
++    )
+     backends.add_argument(
+         "--hf-attn-implementation",
+         default="sdpa",
+@@ -988,13 +1007,18 @@ def validate_required_sparse_kernel_markers(
+         raise RuntimeError("vLLM sparse GEMV marker records are missing.")
+     if marker_summary["ascend_sparse_linear_marker_records"] <= 0:
+         raise RuntimeError("Ascend sparse linear marker records are missing.")
+-    if (
+-        "activation_sparse_linear_packed_t"
+-        not in marker_summary["ascend_sparse_linear_marker_ops"]
++    accepted_ops = {
++        "activation_sparse_linear",
++        "activation_sparse_linear_direct_t",
++        "activation_sparse_linear_packed_t",
++    }
++    if not any(
++        op in accepted_ops
++        for op in marker_summary["ascend_sparse_linear_marker_ops"]
+     ):
+         raise RuntimeError(
+-            "Ascend sparse linear marker did not record "
+-            "activation_sparse_linear_packed_t."
++            "Ascend sparse linear marker did not record a supported sparse "
++            "linear custom op."
+         )
+ 
+ 
+@@ -1030,12 +1054,28 @@ def run_vllm_reference(
+     previous_ascend_marker_path = os.environ.get(
+         "VLLM_ASCEND_SPARSE_LINEAR_MARKER_PATH"
+     )
++    previous_dense_fallback_policy = os.environ.get(
++        "VLLM_SPARSE_GEMV_DENSE_FALLBACK_POLICY"
++    )
++    previous_min_sparsity = os.environ.get("VLLM_SPARSE_GEMV_MIN_SPARSITY")
+     marker_tmpdir: tempfile.TemporaryDirectory[str] | None = None
+     marker_summary: dict[str, Any] | None = None
++    active_min_sparsity: str | None = None
+     if args.vllm_use_sparse_gemv:
+         os.environ["VLLM_SPARSE_GEMV_REQUIRE_KERNEL"] = (
+             "0" if args.vllm_allow_sparse_gemv_fallback else "1"
+         )
++        os.environ["VLLM_SPARSE_GEMV_DENSE_FALLBACK_POLICY"] = (
++            args.vllm_sparse_gemv_dense_fallback_policy
++        )
++        if args.vllm_sparse_gemv_min_sparsity is not None:
++            os.environ["VLLM_SPARSE_GEMV_MIN_SPARSITY"] = str(
++                args.vllm_sparse_gemv_min_sparsity
++            )
++        active_min_sparsity = os.environ.get(
++            "VLLM_SPARSE_GEMV_MIN_SPARSITY",
++            "0.70",
++        )
+         marker_tmpdir = tempfile.TemporaryDirectory(prefix="vllm_ppl_sparse_gemv_")
+         sparse_marker_path = Path(marker_tmpdir.name) / "invocations.jsonl"
+         ascend_marker_path = Path(marker_tmpdir.name) / "ascend_custom_ops.jsonl"
+@@ -1076,12 +1116,25 @@ def run_vllm_reference(
+             os.environ["VLLM_ASCEND_SPARSE_LINEAR_MARKER_PATH"] = (
+                 previous_ascend_marker_path
+             )
++        if previous_dense_fallback_policy is None:
++            os.environ.pop("VLLM_SPARSE_GEMV_DENSE_FALLBACK_POLICY", None)
++        else:
++            os.environ["VLLM_SPARSE_GEMV_DENSE_FALLBACK_POLICY"] = (
++                previous_dense_fallback_policy
++            )
++        if previous_min_sparsity is None:
++            os.environ.pop("VLLM_SPARSE_GEMV_MIN_SPARSITY", None)
++        else:
++            os.environ["VLLM_SPARSE_GEMV_MIN_SPARSITY"] = previous_min_sparsity
+         if marker_tmpdir is not None:
+             marker_tmpdir.cleanup()
+     return BackendComparison(
+         backend=(
+             f"vllm:prefill_sparsify={args.vllm_prefill_sparsify}:"
+-            f"use_sparse_gemv={args.vllm_use_sparse_gemv}"
++            f"use_sparse_gemv={args.vllm_use_sparse_gemv}:"
++            "sparse_gemv_dense_fallback="
++            f"{args.vllm_sparse_gemv_dense_fallback_policy}:"
++            f"sparse_gemv_min_sparsity={active_min_sparsity}"
+         ),
+         dense=dense,
+         sparse=sparse,
+@@ -1159,6 +1212,11 @@ def assert_alignment(
+ 
+ def main() -> int:
+     args = parse_args()
++    if (
++        args.vllm_sparse_gemv_min_sparsity is not None
++        and not 0.0 <= args.vllm_sparse_gemv_min_sparsity <= 1.0
++    ):
++        raise ValueError("--vllm-sparse-gemv-min-sparsity must be in [0, 1]")
+     histogram_path, calibration_path = resolve_artifact_paths(args)
+     tokenizer = load_tokenizer(args.model)
+     texts = load_texts(args)
+@@ -1214,6 +1272,12 @@ def main() -> int:
+                 "hf_reference_impl": args.hf_reference_impl,
+                 "hf_reference_mode": args.hf_reference_mode,
+                 "vllm_prefill_sparsify": args.vllm_prefill_sparsify,
++                "vllm_sparse_gemv_dense_fallback_policy": (
++                    args.vllm_sparse_gemv_dense_fallback_policy
++                ),
++                "vllm_sparse_gemv_min_sparsity": (
++                    args.vllm_sparse_gemv_min_sparsity
++                ),
+                 "histogram_path": str(histogram_path),
+                 "vllm_calibration_path": str(calibration_path),
+             },
+diff --git a/tests/sparsity/test_distribution.py b/tests/sparsity/test_distribution.py
+index cbd9eed8648..3bfd2146f1d 100644
+--- a/tests/sparsity/test_distribution.py
++++ b/tests/sparsity/test_distribution.py
+@@ -291,16 +291,69 @@ def test_sparse_linear_weight_t_cache_invalidates_after_weight_mutation():
+ 
+ def test_sparse_linear_auto_policy_keeps_single_batch_wide_output(monkeypatch):
+     monkeypatch.delenv("VLLM_SPARSE_GEMV_LINEAR_POLICY", raising=False)
+-    sparsify = SparsifyFn(torch.tensor(0.5), use_sparse_gemv=True)
++    monkeypatch.delenv("VLLM_SPARSE_GEMV_MIN_SPARSITY", raising=False)
++    sparsify = SparsifyFn(
++        torch.tensor(0.5),
++        use_sparse_gemv=True,
++        expected_sparsity=0.7,
++    )
+     x = torch.randn(1, 3584)
+     weight = torch.randn(32768, 3584)
+ 
+     assert sparsify._should_use_sparse_linear_kernel(x, weight) is True
+ 
+ 
++def test_sparse_linear_auto_policy_requires_expected_sparsity(monkeypatch):
++    monkeypatch.delenv("VLLM_SPARSE_GEMV_LINEAR_POLICY", raising=False)
++    monkeypatch.delenv("VLLM_SPARSE_GEMV_MIN_SPARSITY", raising=False)
++    x = torch.randn(1, 3584)
++    weight = torch.randn(32768, 3584)
++
++    unknown = SparsifyFn(torch.tensor(0.5), use_sparse_gemv=True)
++    low = SparsifyFn(
++        torch.tensor(0.5),
++        use_sparse_gemv=True,
++        expected_sparsity=0.4,
++    )
++    high = SparsifyFn(
++        torch.tensor(0.5),
++        use_sparse_gemv=True,
++        expected_sparsity=0.7,
++    )
++
++    assert unknown._should_use_sparse_linear_kernel(x, weight) is False
++    assert low._should_use_sparse_linear_kernel(x, weight) is False
++    assert high._should_use_sparse_linear_kernel(x, weight) is True
++
++
++def test_sparse_linear_auto_policy_honors_min_sparsity_env(monkeypatch):
++    monkeypatch.delenv("VLLM_SPARSE_GEMV_LINEAR_POLICY", raising=False)
++    monkeypatch.setenv("VLLM_SPARSE_GEMV_MIN_SPARSITY", "0.75")
++    x = torch.randn(1, 3584)
++    weight = torch.randn(32768, 3584)
++
++    below = SparsifyFn(
++        torch.tensor(0.5),
++        use_sparse_gemv=True,
++        expected_sparsity=0.7,
++    )
++    at_cutoff = SparsifyFn(
++        torch.tensor(0.5),
++        use_sparse_gemv=True,
++        expected_sparsity=0.75,
++    )
++
++    assert below._should_use_sparse_linear_kernel(x, weight) is False
++    assert at_cutoff._should_use_sparse_linear_kernel(x, weight) is True
++
++
+ def test_sparse_linear_auto_policy_skips_losing_shapes(monkeypatch):
+     monkeypatch.delenv("VLLM_SPARSE_GEMV_LINEAR_POLICY", raising=False)
+-    sparsify = SparsifyFn(torch.tensor(0.5), use_sparse_gemv=True)
++    sparsify = SparsifyFn(
++        torch.tensor(0.5),
++        use_sparse_gemv=True,
++        expected_sparsity=0.7,
++    )
+ 
+     assert not sparsify._should_use_sparse_linear_kernel(
+         torch.randn(2, 3584),
+@@ -328,6 +381,36 @@ def test_sparse_linear_policy_overrides(monkeypatch):
+     assert sparsify._should_use_sparse_linear_kernel(x, weight) is False
+ 
+ 
++def test_sparse_linear_dense_fallback_masks_by_default(monkeypatch):
++    monkeypatch.delenv("VLLM_SPARSE_GEMV_DENSE_FALLBACK_POLICY", raising=False)
++    sparsify = SparsifyFn(torch.tensor(0.5), use_sparse_gemv=True)
++    x = torch.tensor([[0.25, 1.0]])
++
++    out = sparsify.apply_dense_fallback(x)
++
++    assert torch.equal(out, torch.tensor([[0.0, 1.0]]))
++
++
++def test_sparse_linear_identity_fallback_skips_all_row_mask(monkeypatch):
++    monkeypatch.setenv("VLLM_SPARSE_GEMV_DENSE_FALLBACK_POLICY", "identity")
++    sparsify = SparsifyFn(torch.tensor(0.5), use_sparse_gemv=True)
++    x = torch.tensor([[0.25, 1.0]])
++
++    out = sparsify.apply_dense_fallback(x)
++
++    assert out is x
++
++
++def test_sparse_linear_identity_fallback_keeps_mixed_prefill_mask(monkeypatch):
++    monkeypatch.setenv("VLLM_SPARSE_GEMV_DENSE_FALLBACK_POLICY", "identity")
++    sparsify = SparsifyFn(torch.tensor(0.5), use_sparse_gemv=True)
++    x = torch.tensor([[0.25, 1.0], [0.25, 1.0]])
++
++    out = sparsify.apply_dense_fallback(x)
++
++    assert torch.equal(out, torch.tensor([[0.25, 1.0], [0.0, 1.0]]))
++
++
+ def test_sparse_gemv_marker_records_tensor_metadata(tmp_path, monkeypatch):
+     from vllm.sparsity.kernels.sparse_gemv import (
+         _record_sparse_gemv_invocation,
+diff --git a/tests/sparsity/test_layers.py b/tests/sparsity/test_layers.py
+index b1e4bf1e790..5f04b42a46b 100644
+--- a/tests/sparsity/test_layers.py
++++ b/tests/sparsity/test_layers.py
+@@ -36,13 +36,17 @@ def test_build_sparsifier_success():
+         torch.save(torch.tensor(0.5), threshold_path)
+ 
+         cfg = ActivationSparsityConfig(
+-            enable=True, calibration_path=tmpdir, apply_all_tokens=True
++            enable=True,
++            calibration_path=tmpdir,
++            uniform_sparsity=0.7,
++            apply_all_tokens=True,
+         )
+         sparsifier = build_sparsifier(cfg, layer_idx=0, proj_name="mlp.gate_up")
+ 
+         assert sparsifier is not None
+         assert sparsifier.apply_all_tokens is True
+         assert sparsifier.prefill_sparsify == "half"
++        assert sparsifier.expected_sparsity == 0.7
+         x = torch.randn(4, 8)
+         out = sparsifier(x)
+         # With threshold 0.5, some values should be zeroed
+@@ -84,6 +88,7 @@ def test_build_sparsifier_larosa():
+         assert isinstance(sparsifier, LaRosaSparsifyFn)
+         assert sparsifier.rotate_input is True
+         assert sparsifier.sparsity_level == 0.4
++        assert sparsifier.expected_sparsity == 0.4
+         assert sparsifier.apply_all_tokens is False
+         assert sparsifier.prefill_sparsify == "half"
+         x = torch.randn(4, hidden)
+@@ -130,5 +135,6 @@ def test_build_sparsifier_larosa_second_site_no_rotation_required():
+         assert isinstance(sparsifier, LaRosaSparsifyFn)
+         assert sparsifier.rotate_input is False
+         assert sparsifier.sparsity_level == 0.6
++        assert sparsifier.expected_sparsity == 0.6
+         assert sparsifier.apply_all_tokens is False
+         assert sparsifier.prefill_sparsify == "half"
+diff --git a/vllm/model_executor/models/llama.py b/vllm/model_executor/models/llama.py
+index ce032a3346e..47d6b001602 100644
+--- a/vllm/model_executor/models/llama.py
++++ b/vllm/model_executor/models/llama.py
+@@ -151,7 +151,7 @@ class LlamaMLP(nn.Module):
+             x, _ = sparse_gate_up
+         else:
+             if self.sparsify_gate_up is not None:
+-                x = self.sparsify_gate_up(x)
++                x = self.sparsify_gate_up.apply_dense_fallback(x)
+             x, _ = self.gate_up_proj(x)
+         x = self.act_fn(x)
+         sparse_down = (
+@@ -163,7 +163,7 @@ class LlamaMLP(nn.Module):
+             x, _ = sparse_down
+             return x
+         if self.sparsify_down is not None:
+-            x = self.sparsify_down(x)
++            x = self.sparsify_down.apply_dense_fallback(x)
+         x, _ = self.down_proj(x)
+         return x
+ 
+@@ -301,7 +301,9 @@ class LlamaAttention(nn.Module):
+             qkv, _ = sparse_qkv
+         else:
+             if self.sparsify_qkv is not None:
+-                hidden_states = self.sparsify_qkv(hidden_states)
++                hidden_states = self.sparsify_qkv.apply_dense_fallback(
++                    hidden_states
++                )
+             qkv, _ = self.qkv_proj(hidden_states)
+         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+         q, k = self.rotary_emb(positions, q, k)
+@@ -315,7 +317,7 @@ class LlamaAttention(nn.Module):
+             output, _ = sparse_o
+             return output
+         if self.sparsify_o is not None:
+-            attn_output = self.sparsify_o(attn_output)
++            attn_output = self.sparsify_o.apply_dense_fallback(attn_output)
+         output, _ = self.o_proj(attn_output)
+         return output
+ 
+diff --git a/vllm/model_executor/models/qwen2.py b/vllm/model_executor/models/qwen2.py
+index 8ee0e188680..7ee849ae2fc 100644
+--- a/vllm/model_executor/models/qwen2.py
++++ b/vllm/model_executor/models/qwen2.py
+@@ -145,7 +145,7 @@ class Qwen2MLP(nn.Module):
+             gate_up, _ = sparse_gate_up
+         else:
+             if self.sparsify_gate_up is not None:
+-                x = self.sparsify_gate_up(x)
++                x = self.sparsify_gate_up.apply_dense_fallback(x)
+             gate_up, _ = self.gate_up_proj(x)
+         x = self.act_fn(gate_up)
+         sparse_down = (
+@@ -157,7 +157,7 @@ class Qwen2MLP(nn.Module):
+             x, _ = sparse_down
+             return x
+         if self.sparsify_down is not None:
+-            x = self.sparsify_down(x)
++            x = self.sparsify_down.apply_dense_fallback(x)
+         x, _ = self.down_proj(x)
+         return x
+ 
+@@ -285,7 +285,9 @@ class Qwen2Attention(nn.Module):
+             qkv, _ = sparse_qkv
+         else:
+             if self.sparsify_qkv is not None:
+-                hidden_states = self.sparsify_qkv(hidden_states)
++                hidden_states = self.sparsify_qkv.apply_dense_fallback(
++                    hidden_states
++                )
+             qkv, _ = self.qkv_proj(hidden_states)
+         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+ 
+@@ -316,7 +318,7 @@ class Qwen2Attention(nn.Module):
+             output, _ = sparse_o
+             return output
+         if self.sparsify_o is not None:
+-            attn_output = self.sparsify_o(attn_output)
++            attn_output = self.sparsify_o.apply_dense_fallback(attn_output)
+         output, _ = self.o_proj(attn_output)
+         return output
+ 
+diff --git a/vllm/sparsity/distribution.py b/vllm/sparsity/distribution.py
+index af2c59d559f..a93474ecd11 100644
+--- a/vllm/sparsity/distribution.py
++++ b/vllm/sparsity/distribution.py
+@@ -7,6 +7,9 @@ import torch
+ from torch import nn
+ 
+ 
++_DEFAULT_SPARSE_GEMV_MIN_SPARSITY = 0.70
++
++
+ class Distribution:
+     """Histogram-based distribution for threshold calibration.
+ 
+@@ -81,6 +84,7 @@ class SparsifyFn(nn.Module):
+         apply_all_tokens: bool = False,
+         prefill_sparsify: str = "half",
+         use_sparse_gemv: bool = False,
++        expected_sparsity: float | None = None,
+     ) -> None:
+         super().__init__()
+         if prefill_sparsify not in {"half", "all", "none"}:
+@@ -94,6 +98,7 @@ class SparsifyFn(nn.Module):
+         self.apply_all_tokens = apply_all_tokens
+         self.prefill_sparsify = prefill_sparsify
+         self.use_sparse_gemv = use_sparse_gemv
++        self.expected_sparsity = expected_sparsity
+ 
+     def forward(self, x: torch.Tensor) -> torch.Tensor:
+         if self.apply_all_tokens:
+@@ -123,6 +128,23 @@ class SparsifyFn(nn.Module):
+             torch.zeros_like(x),
+         )
+ 
++    def apply_dense_fallback(self, x: torch.Tensor) -> torch.Tensor:
++        """Apply the dense fallback for projections without a sparse kernel.
++
++        ``mask`` preserves TEAL/La RoSA semantics by applying the sparsifier
++        before the dense linear. ``identity`` is an explicit kernel-only
++        profiling policy: if the current forward would sparsify every row but
++        the sparse linear policy rejected this projection, leave it dense so
++        unprofitable dense masking does not dominate model throughput.
++        """
++        if (
++            self.use_sparse_gemv
++            and self._dense_fallback_policy() == "identity"
++            and self._sparse_linear_applies_to_all_rows(x)
++        ):
++            return x
++        return self(x)
++
+     def try_apply_linear(
+         self,
+         x: torch.Tensor,
+@@ -218,6 +240,8 @@ class SparsifyFn(nn.Module):
+             return False
+         if mode != "auto":
+             return False
++        if not self._meets_sparse_linear_min_sparsity():
++            return False
+         return (
+             sparse_input.dim() == 2
+             and sparse_input.shape[0] == 1
+@@ -226,6 +250,32 @@ class SparsifyFn(nn.Module):
+             and weight.shape[0] >= 32768
+         )
+ 
++    def _meets_sparse_linear_min_sparsity(self) -> bool:
++        if self.expected_sparsity is None:
++            return False
++        return self.expected_sparsity >= self._sparse_linear_min_sparsity()
++
++    def _sparse_linear_min_sparsity(self) -> float:
++        value = os.environ.get("VLLM_SPARSE_GEMV_MIN_SPARSITY")
++        if value is None:
++            return _DEFAULT_SPARSE_GEMV_MIN_SPARSITY
++        try:
++            parsed = float(value)
++        except ValueError:
++            return _DEFAULT_SPARSE_GEMV_MIN_SPARSITY
++        return min(1.0, max(0.0, parsed))
++
++    def _dense_fallback_policy(self) -> str:
++        mode = os.environ.get(
++            "VLLM_SPARSE_GEMV_DENSE_FALLBACK_POLICY",
++            "mask",
++        ).lower()
++        if mode in {"mask", "masked"}:
++            return "mask"
++        if mode in {"identity", "dense", "kernel_only", "kernel-only"}:
++            return "identity"
++        return "mask"
++
+     def _sparse_linear_applies_to_all_rows(self, x: torch.Tensor) -> bool:
+         if self.apply_all_tokens or self.prefill_sparsify == "all":
+             return True
+@@ -358,10 +408,13 @@ class SparsifyFn(nn.Module):
+         return row_mask
+ 
+     def _get_cached_forward_mask(self, cache_key: tuple) -> torch.Tensor | None:
+-        from vllm.forward_context import (
+-            get_forward_context,
+-            is_forward_context_available,
+-        )
++        try:
++            from vllm.forward_context import (
++                get_forward_context,
++                is_forward_context_available,
++            )
++        except Exception:
++            return None
+ 
+         if not is_forward_context_available():
+             return None
+@@ -370,10 +423,13 @@ class SparsifyFn(nn.Module):
+         return cache.get(cache_key)
+ 
+     def _set_cached_forward_mask(self, cache_key: tuple, mask: torch.Tensor) -> None:
+-        from vllm.forward_context import (
+-            get_forward_context,
+-            is_forward_context_available,
+-        )
++        try:
++            from vllm.forward_context import (
++                get_forward_context,
++                is_forward_context_available,
++            )
++        except Exception:
++            return
+ 
+         if not is_forward_context_available():
+             return
+@@ -382,10 +438,13 @@ class SparsifyFn(nn.Module):
+         cache[cache_key] = mask
+ 
+     def _get_vllm_request_slices(self, x: torch.Tensor) -> list[tuple[int, int]] | None:
+-        from vllm.forward_context import (
+-            get_forward_context,
+-            is_forward_context_available,
+-        )
++        try:
++            from vllm.forward_context import (
++                get_forward_context,
++                is_forward_context_available,
++            )
++        except Exception:
++            return None
+ 
+         if not is_forward_context_available():
+             return None
+@@ -420,7 +479,8 @@ class SparsifyFn(nn.Module):
+             f"threshold={self.threshold.item():.4f}, "
+             f"decode_only={self.decode_only}, "
+             f"apply_all_tokens={self.apply_all_tokens}, "
+-            f"prefill_sparsify={self.prefill_sparsify}"
++            f"prefill_sparsify={self.prefill_sparsify}, "
++            f"expected_sparsity={self.expected_sparsity}"
+         )
+ 
+ 
+@@ -466,6 +526,7 @@ class LaRosaSparsifyFn(SparsifyFn):
+         apply_all_tokens: bool = True,
+         prefill_sparsify: str = "all",
+         use_sparse_gemv: bool = False,
++        expected_sparsity: float | None = None,
+     ) -> None:
+         super().__init__(
+             threshold=torch.tensor(0.0),
+@@ -473,6 +534,9 @@ class LaRosaSparsifyFn(SparsifyFn):
+             apply_all_tokens=apply_all_tokens,
+             prefill_sparsify=prefill_sparsify,
+             use_sparse_gemv=use_sparse_gemv,
++            expected_sparsity=(
++                sparsity_level if expected_sparsity is None else expected_sparsity
++            ),
+         )
+         if rotate_input and rotation is None:
+             raise ValueError("La RoSA rotate_input=True requires a rotation matrix.")
+@@ -552,5 +616,6 @@ class LaRosaSparsifyFn(SparsifyFn):
+             f"rotation_shape={rotation_shape}, "
+             f"decode_only={self.decode_only}, "
+             f"apply_all_tokens={self.apply_all_tokens}, "
+-            f"prefill_sparsify={self.prefill_sparsify}"
++            f"prefill_sparsify={self.prefill_sparsify}, "
++            f"expected_sparsity={self.expected_sparsity}"
+         )
+diff --git a/vllm/sparsity/layers.py b/vllm/sparsity/layers.py
+index 47dc5c0418b..ac7b1e5ddb9 100644
+--- a/vllm/sparsity/layers.py
++++ b/vllm/sparsity/layers.py
+@@ -66,6 +66,7 @@ def build_sparsifier(
+         apply_all_tokens=sparsity_config.apply_all_tokens,
+         prefill_sparsify=sparsity_config.prefill_sparsify,
+         use_sparse_gemv=sparsity_config.use_sparse_gemv,
++        expected_sparsity=sparsity_config.uniform_sparsity,
+     )
+ 
+     return sparsify_fn
+@@ -106,6 +107,7 @@ def _build_larosa_sparsifier(
+             apply_all_tokens=sparsity_config.apply_all_tokens,
+             prefill_sparsify=sparsity_config.prefill_sparsify,
+             use_sparse_gemv=sparsity_config.use_sparse_gemv,
++            expected_sparsity=sparse_level,
+         )
+ 
+     if proj_name in second_site_projs:
+@@ -118,6 +120,7 @@ def _build_larosa_sparsifier(
+             apply_all_tokens=sparsity_config.apply_all_tokens,
+             prefill_sparsify=sparsity_config.prefill_sparsify,
+             use_sparse_gemv=sparsity_config.use_sparse_gemv,
++            expected_sparsity=sparse_level,
+         )
+ 
+     logger.warning_once("Unsupported La RoSA projection %s; skipping.", proj_name)
+-- 
+2.53.0.windows.3
+
