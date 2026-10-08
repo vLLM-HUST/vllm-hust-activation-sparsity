@@ -1,0 +1,44 @@
+{
+  "canonical_repository": "https://github.com/vLLM-HUST/vllm-hust-activation-sparsity",
+  "display_name": "Activation Sparsity",
+  "evidence": {
+    "index": "https://github.com/vLLM-HUST/vllm-hust-activation-sparsity",
+    "latest_result": "https://github.com/vLLM-HUST/vllm-hust-activation-sparsity",
+    "performance_claims": [],
+    "qualification": "unqualified"
+  },
+  "lifecycle": {
+    "activation_contract": "See the extension manifest and README; discovery alone does not enable this MOD.",
+    "default_enabled": false,
+    "rollback_contract": "Disable the MOD and return to the unmodified host path.",
+    "status": "incubating"
+  },
+  "metadata_source": {
+    "commit": "7df1647048ac5f05fcc502ce4bea94f26d0f5362",
+    "repository": "vLLM-HUST/vllm-hust-website"
+  },
+  "mod_id": "activation-sparsity-migration",
+  "repository": "vllm-hust-activation-sparsity",
+  "responsibility": {
+    "advisor_status": "declared",
+    "advisors": [
+      {
+        "name": "Yao Wan / 万瑶",
+        "relationship": "internal"
+      }
+    ],
+    "maintainers": [
+      {
+        "github": "llxler",
+        "name": "雷翔麟"
+      }
+    ],
+    "organization": "vLLM-HUST"
+  },
+  "schema_version": "vllm-hust-mod-metadata-v1",
+  "scope": {
+    "mechanism": "operator_runtime",
+    "out_of_scope": [],
+    "supported_workloads": []
+  }
+}
